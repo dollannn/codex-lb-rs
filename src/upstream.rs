@@ -295,3 +295,48 @@ fn oauth_error_message(payload: &OAuthTokenPayload) -> Option<String> {
 pub fn should_refresh(last_refresh_at: DateTime<Utc>, interval_days: i64) -> bool {
     Utc::now().signed_duration_since(last_refresh_at).num_days() >= interval_days
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{extract_usage_from_sse, model_from_body, parse_primary_usage_window};
+
+    #[test]
+    fn model_from_body_reads_model_field() {
+        let model = model_from_body(br#"{"model":"gpt-5.1-codex-mini","input":"hi"}"#);
+
+        assert_eq!(model.as_deref(), Some("gpt-5.1-codex-mini"));
+    }
+
+    #[test]
+    fn extract_usage_from_sse_reads_nested_response_usage() {
+        let usage = extract_usage_from_sse(concat!(
+            "event: response.completed\n",
+            "data: {\"response\":{\"usage\":{\"input_tokens\":12,\"output_tokens\":5,",
+            "\"input_tokens_details\":{\"cached_tokens\":3},",
+            "\"output_tokens_details\":{\"reasoning_tokens\":2}}}}\n\n",
+            "data: [DONE]\n\n",
+        ));
+
+        assert_eq!(usage.input_tokens, Some(12));
+        assert_eq!(usage.output_tokens, Some(5));
+        assert_eq!(usage.cached_input_tokens, Some(3));
+        assert_eq!(usage.reasoning_tokens, Some(2));
+    }
+
+    #[test]
+    fn parse_primary_usage_window_reads_used_percent_and_reset() {
+        let (used_percent, reset_at) = parse_primary_usage_window(&json!({
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 42.5,
+                    "reset_at": 1_700_000_000
+                }
+            }
+        }));
+
+        assert_eq!(used_percent, Some(42.5));
+        assert_eq!(reset_at.unwrap().timestamp(), 1_700_000_000);
+    }
+}

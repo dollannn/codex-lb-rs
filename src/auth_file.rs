@@ -80,3 +80,59 @@ pub fn decode_jwt_payload(token: &str) -> Option<Value> {
     let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
     serde_json::from_slice(&decoded).ok()
 }
+
+#[cfg(test)]
+mod tests {
+    use base64::Engine as _;
+    use serde_json::json;
+
+    use super::{AuthFile, AuthTokens, URL_SAFE_NO_PAD, claims_from_auth, parse_auth_json};
+
+    #[test]
+    fn claims_from_auth_decodes_id_token_and_prefers_token_account_id() {
+        let auth = AuthFile {
+            openai_api_key: None,
+            tokens: AuthTokens {
+                id_token: jwt(json!({
+                    "email": "person@example.com",
+                    "https://api.openai.com/auth": {
+                        "chatgpt_account_id": "claim-account",
+                        "chatgpt_plan_type": "plus"
+                    }
+                })),
+                access_token: "access".to_string(),
+                refresh_token: "refresh".to_string(),
+                account_id: Some("token-account".to_string()),
+            },
+            last_refresh_at: None,
+        };
+
+        let claims = claims_from_auth(&auth);
+
+        assert_eq!(claims.email, "person@example.com");
+        assert_eq!(claims.plan_type, "plus");
+        assert_eq!(claims.chatgpt_account_id.as_deref(), Some("token-account"));
+    }
+
+    #[test]
+    fn parse_auth_json_rejects_missing_tokens() {
+        let error = parse_auth_json(json!({
+            "tokens": {
+                "idToken": "id",
+                "accessToken": "",
+                "refreshToken": "refresh"
+            }
+        }))
+        .expect_err("empty access token should be rejected");
+
+        assert!(error.to_string().contains("missing one or more tokens"));
+    }
+
+    fn jwt(payload: serde_json::Value) -> String {
+        format!(
+            "{}.{}.sig",
+            URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#),
+            URL_SAFE_NO_PAD.encode(payload.to_string())
+        )
+    }
+}

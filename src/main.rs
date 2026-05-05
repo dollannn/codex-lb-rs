@@ -27,6 +27,7 @@ use crate::{
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
+    let _ = dotenvy::dotenv();
     let cli = Cli::parse();
 
     match &cli.command {

@@ -8,8 +8,8 @@ use crate::{
     crypto::TokenCrypto,
     error::{AppError, AppResult},
     models::{
-        Account, AccountSummary, AccountTokens, LogsQuery, RequestLog, SelectedAccount, SettingRow,
-        UsageData, UsageSnapshot, UsageSummary,
+        Account, AccountSummary, AccountTokens, LogsQuery, RequestLog, RuntimeSettings,
+        SelectedAccount, SettingRow, UsageData, UsageSnapshot, UsageSummary,
     },
 };
 
@@ -204,32 +204,38 @@ pub async fn update_account_tokens(
 }
 
 pub async fn select_account(pool: &PgPool, crypto: &TokenCrypto) -> AppResult<SelectedAccount> {
+    ensure_runtime_rows(pool).await?;
+
+    let mut tx = pool.begin().await?;
     let account = sqlx::query_as::<_, Account>(
         r#"
+        WITH candidate AS (
+            SELECT a.id
+            FROM accounts a
+            INNER JOIN account_runtime_state r ON r.account_id = a.id
+            WHERE a.status = 'active'
+              AND (r.cooldown_until IS NULL OR r.cooldown_until <= now())
+            ORDER BY COALESCE(r.last_selected_at, 'epoch'::timestamptz) ASC, a.created_at ASC
+            FOR UPDATE OF r SKIP LOCKED
+            LIMIT 1
+        ), updated AS (
+            UPDATE account_runtime_state r
+            SET last_selected_at = now(),
+                cooldown_until = NULL,
+                updated_at = now()
+            FROM candidate
+            WHERE r.account_id = candidate.id
+            RETURNING r.account_id
+        )
         SELECT a.*
         FROM accounts a
-        LEFT JOIN account_runtime_state r ON r.account_id = a.id
-        WHERE a.status = 'active'
-          AND (r.cooldown_until IS NULL OR r.cooldown_until <= now())
-        ORDER BY COALESCE(r.last_selected_at, 'epoch'::timestamptz) ASC, a.created_at ASC
-        LIMIT 1
+        INNER JOIN updated u ON u.account_id = a.id
         "#,
     )
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| AppError::BadRequest("no active accounts available".to_string()))?;
-
-    ensure_runtime_row(pool, account.id).await?;
-    sqlx::query(
-        r#"
-        UPDATE account_runtime_state
-        SET last_selected_at = now(), updated_at = now()
-        WHERE account_id = $1
-        "#,
-    )
-    .bind(account.id)
-    .execute(pool)
-    .await?;
+    tx.commit().await?;
 
     let tokens = AccountTokens {
         access_token: crypto.decrypt(&account.encrypted_access_token)?,
@@ -419,6 +425,24 @@ pub async fn list_settings(pool: &PgPool) -> AppResult<Vec<SettingRow>> {
         .map_err(AppError::Database)
 }
 
+pub async fn runtime_settings(pool: &PgPool) -> AppResult<RuntimeSettings> {
+    let rows = sqlx::query_as::<_, SettingRow>(
+        r#"
+        SELECT * FROM settings
+        WHERE key IN ('routing_strategy', 'proxy_max_attempts', 'rate_limit_cooldown_seconds')
+        ORDER BY key
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut settings = RuntimeSettings::default();
+    for row in rows {
+        settings.apply(&row.key, &row.value);
+    }
+    Ok(settings)
+}
+
 pub async fn upsert_settings(
     pool: &PgPool,
     settings: serde_json::Map<String, Value>,
@@ -447,6 +471,19 @@ async fn ensure_runtime_row(pool: &PgPool, account_id: Uuid) -> AppResult<()> {
         "#,
     )
     .bind(account_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn ensure_runtime_rows(pool: &PgPool) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO account_runtime_state (account_id)
+        SELECT id FROM accounts
+        ON CONFLICT (account_id) DO NOTHING
+        "#,
+    )
     .execute(pool)
     .await?;
     Ok(())

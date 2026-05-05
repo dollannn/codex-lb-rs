@@ -20,7 +20,6 @@ use crate::{
 };
 
 const SSE_CAPTURE_LIMIT: usize = 4 * 1024 * 1024;
-const RATE_LIMIT_COOLDOWN_SECONDS: i64 = 60;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -38,8 +37,9 @@ async fn proxy_responses(
     validate_proxy_auth(&state, &headers)?;
     let request_id = request_id(&headers);
     let model = upstream::model_from_body(&body);
-    let active_count = db::account_count(&state.pool).await?.max(1);
-    let attempts = active_count.min(2);
+    let settings = db::runtime_settings(&state.pool).await?;
+    let active_count = db::account_count(&state.pool).await?;
+    let attempts = proxy_attempts(active_count, settings.proxy_max_attempts);
     let mut last_error: Option<AppError> = None;
 
     for _ in 0..attempts {
@@ -95,7 +95,7 @@ async fn proxy_responses(
             db::cooldown_account(
                 &state.pool,
                 selected.account.id,
-                RATE_LIMIT_COOLDOWN_SECONDS,
+                settings.rate_limit_cooldown_seconds,
                 "upstream rate limited",
             )
             .await
@@ -185,6 +185,14 @@ async fn proxy_responses(
 
     Err(last_error
         .unwrap_or_else(|| AppError::BadRequest("no account could handle request".to_string())))
+}
+
+fn proxy_attempts(active_count: i64, max_attempts: usize) -> usize {
+    if active_count <= 0 {
+        1
+    } else {
+        (active_count as usize).min(max_attempts.max(1))
+    }
 }
 
 fn logged_sse_stream(
@@ -328,4 +336,25 @@ fn request_id(headers: &HeaderMap) -> String {
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| Uuid::new_v4().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::proxy_attempts;
+
+    #[test]
+    fn proxy_attempts_use_one_attempt_when_no_accounts_so_error_is_reported() {
+        assert_eq!(proxy_attempts(0, 3), 1);
+    }
+
+    #[test]
+    fn proxy_attempts_limit_by_active_accounts_and_setting() {
+        assert_eq!(proxy_attempts(5, 3), 3);
+        assert_eq!(proxy_attempts(2, 5), 2);
+    }
+
+    #[test]
+    fn proxy_attempts_never_use_zero_setting() {
+        assert_eq!(proxy_attempts(2, 0), 1);
+    }
 }

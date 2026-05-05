@@ -108,3 +108,57 @@ fn default_encryption_key_file() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."));
     home.join(".codex-lb-rs").join("encryption.key")
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{path::PathBuf, time::Duration};
+
+    use super::Config;
+
+    #[test]
+    fn upstream_responses_url_appends_codex_responses() {
+        let config = config_with_upstream("https://chatgpt.com/backend-api/");
+
+        assert_eq!(
+            config.upstream_codex_responses_url(),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+    }
+
+    #[test]
+    fn usage_url_handles_backend_api_base() {
+        let config = config_with_upstream("https://chatgpt.com/backend-api");
+
+        assert_eq!(
+            config.upstream_usage_url(),
+            "https://chatgpt.com/backend-api/wham/usage"
+        );
+    }
+
+    #[test]
+    fn usage_url_adds_backend_api_when_base_is_origin() {
+        let config = config_with_upstream("https://chatgpt.com");
+
+        assert_eq!(
+            config.upstream_usage_url(),
+            "https://chatgpt.com/backend-api/wham/usage"
+        );
+    }
+
+    fn config_with_upstream(upstream_base_url: &str) -> Config {
+        Config {
+            database_url: "postgres://example".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 2455,
+            upstream_base_url: upstream_base_url.to_string(),
+            auth_base_url: "https://auth.openai.com".to_string(),
+            oauth_client_id: "client".to_string(),
+            oauth_scope: "openid profile email".to_string(),
+            encryption_key_file: PathBuf::from("key"),
+            admin_token: None,
+            proxy_api_token: None,
+            request_timeout: Duration::from_secs(1),
+            token_refresh_interval_days: 8,
+        }
+    }
+}
