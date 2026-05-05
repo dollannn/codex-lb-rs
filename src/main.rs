@@ -1,26 +1,13 @@
-mod admin;
-mod auth_file;
-mod cli;
-mod config;
-mod crypto;
-mod db;
-mod error;
-mod models;
-mod proxy;
-mod state;
-mod upstream;
-
 use anyhow::Result;
-use axum::{Json, Router, extract::State, routing::get};
 use clap::Parser;
-use serde_json::Value;
-use tower_http::trace::TraceLayer;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::{
-    cli::{Cli, Command, MigrateCommand},
+use codex_lb_rs::{
+    build_app,
+    cli::{self, Cli, Command, MigrateCommand},
     config::Config,
     crypto::TokenCrypto,
+    db,
     state::AppState,
 };
 
@@ -70,12 +57,7 @@ async fn serve(config: Config) -> Result<()> {
     }
 
     let state = AppState::new(config, pool, crypto);
-    let app = Router::new()
-        .route("/health", get(health))
-        .nest("/admin", admin::router(state.clone()))
-        .merge(proxy::router())
-        .with_state(state)
-        .layer(TraceLayer::new_for_http());
+    let app = build_app(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "codex-lb-rs listening");
@@ -83,15 +65,6 @@ async fn serve(config: Config) -> Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
-}
-
-async fn health(State(state): State<AppState>) -> Json<Value> {
-    let db_ok = sqlx::query_scalar::<_, i32>("SELECT 1")
-        .fetch_one(&state.pool)
-        .await
-        .ok()
-        == Some(1);
-    Json(serde_json::json!({ "status": if db_ok { "ok" } else { "degraded" }, "database": db_ok }))
 }
 
 async fn shutdown_signal() {

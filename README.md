@@ -22,6 +22,13 @@ The frontend, full Python compatibility, WebSockets, and non-responses endpoints
    docker compose up -d postgres
    ```
 
+   If local port `5432` is already in use, start Postgres on another host port
+   and update `CODEX_LB_DATABASE_URL` accordingly:
+
+   ```bash
+   CODEX_LB_POSTGRES_PORT=55432 docker compose up -d postgres
+   ```
+
 2. Create local config:
 
    ```bash
@@ -114,3 +121,29 @@ cargo fmt --check
 cargo check
 cargo test
 ```
+
+The default test suite skips destructive Postgres integration coverage unless a
+test database URL is explicitly provided. The integration smoke test applies
+migrations, truncates app tables, starts an in-process fake upstream, and checks
+admin auth, proxy auth, 429 failover, SSE usage logging, and usage summary
+aggregation.
+
+```bash
+createdb codex_lb_test
+CODEX_LB_TEST_DATABASE_URL=postgres://codex_lb:codex_lb@127.0.0.1:5432/codex_lb_test \
+  cargo test --test postgres_proxy -- --nocapture
+```
+
+When using the Compose database on a non-default host port, create the test
+database inside the container and point the test at that port:
+
+```bash
+CODEX_LB_POSTGRES_PORT=55432 docker compose up -d postgres
+until docker compose exec -T postgres pg_isready -U codex_lb -d codex_lb; do sleep 1; done
+docker compose exec -T postgres createdb -U codex_lb codex_lb_test
+CODEX_LB_TEST_DATABASE_URL=postgres://codex_lb:codex_lb@127.0.0.1:55432/codex_lb_test \
+  cargo test --test postgres_proxy -- --nocapture
+```
+
+For safety, `CODEX_LB_TEST_DATABASE_URL` must contain `test` unless you also set
+`CODEX_LB_ALLOW_DESTRUCTIVE_TEST_DB=1`.
