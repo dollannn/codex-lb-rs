@@ -1,0 +1,110 @@
+use std::{env, net::SocketAddr, path::PathBuf, time::Duration};
+
+use anyhow::{Context, Result};
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub database_url: String,
+    pub host: String,
+    pub port: u16,
+    pub upstream_base_url: String,
+    pub auth_base_url: String,
+    pub oauth_client_id: String,
+    pub oauth_scope: String,
+    pub encryption_key_file: PathBuf,
+    pub admin_token: Option<String>,
+    pub proxy_api_token: Option<String>,
+    pub request_timeout: Duration,
+    pub token_refresh_interval_days: i64,
+}
+
+impl Config {
+    pub fn from_env() -> Result<Self> {
+        let _ = dotenvy::dotenv();
+
+        let database_url = env_var("CODEX_LB_DATABASE_URL")
+            .unwrap_or_else(|| "postgres://codex_lb:codex_lb@127.0.0.1:5432/codex_lb".to_string());
+        let host = env_var("HOST").unwrap_or_else(|| "127.0.0.1".to_string());
+        let port = env_var("PORT")
+            .or_else(|| env_var("CODEX_LB_PORT"))
+            .unwrap_or_else(|| "2455".to_string())
+            .parse::<u16>()
+            .context("PORT/CODEX_LB_PORT must be a valid TCP port")?;
+        let upstream_base_url = env_var("CODEX_LB_UPSTREAM_BASE_URL")
+            .unwrap_or_else(|| "https://chatgpt.com/backend-api".to_string());
+        let auth_base_url = env_var("CODEX_LB_AUTH_BASE_URL")
+            .unwrap_or_else(|| "https://auth.openai.com".to_string());
+        let oauth_client_id = env_var("CODEX_LB_OAUTH_CLIENT_ID")
+            .unwrap_or_else(|| "app_EMoamEEZ73f0CkXaXp7hrann".to_string());
+        let oauth_scope =
+            env_var("CODEX_LB_OAUTH_SCOPE").unwrap_or_else(|| "openid profile email".to_string());
+        let encryption_key_file = env_var("CODEX_LB_ENCRYPTION_KEY_FILE")
+            .map(PathBuf::from)
+            .unwrap_or_else(default_encryption_key_file);
+        let request_timeout = Duration::from_secs(
+            env_var("CODEX_LB_PROXY_REQUEST_BUDGET_SECONDS")
+                .unwrap_or_else(|| "600".to_string())
+                .parse::<u64>()
+                .context("CODEX_LB_PROXY_REQUEST_BUDGET_SECONDS must be an integer")?,
+        );
+        let token_refresh_interval_days = env_var("CODEX_LB_TOKEN_REFRESH_INTERVAL_DAYS")
+            .unwrap_or_else(|| "8".to_string())
+            .parse::<i64>()
+            .context("CODEX_LB_TOKEN_REFRESH_INTERVAL_DAYS must be an integer")?;
+
+        Ok(Self {
+            database_url,
+            host,
+            port,
+            upstream_base_url,
+            auth_base_url,
+            oauth_client_id,
+            oauth_scope,
+            encryption_key_file,
+            admin_token: env_var("CODEX_LB_ADMIN_TOKEN"),
+            proxy_api_token: env_var("CODEX_LB_PROXY_API_TOKEN"),
+            request_timeout,
+            token_refresh_interval_days,
+        })
+    }
+
+    pub fn socket_addr(&self) -> Result<SocketAddr> {
+        format!("{}:{}", self.host, self.port)
+            .parse()
+            .with_context(|| format!("invalid listen address {}:{}", self.host, self.port))
+    }
+
+    pub fn upstream_codex_responses_url(&self) -> String {
+        format!(
+            "{}/codex/responses",
+            self.upstream_base_url.trim_end_matches('/')
+        )
+    }
+
+    pub fn upstream_usage_url(&self) -> String {
+        let base = self.upstream_base_url.trim_end_matches('/');
+        if base.ends_with("/backend-api") || base.contains("/backend-api/") {
+            format!("{base}/wham/usage")
+        } else {
+            format!("{base}/backend-api/wham/usage")
+        }
+    }
+
+    pub fn token_refresh_url(&self) -> String {
+        format!("{}/oauth/token", self.auth_base_url.trim_end_matches('/'))
+    }
+}
+
+fn env_var(key: &str) -> Option<String> {
+    env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn default_encryption_key_file() -> PathBuf {
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".codex-lb-rs").join("encryption.key")
+}
