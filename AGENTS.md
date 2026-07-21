@@ -1,31 +1,45 @@
 # AGENTS.md
 
 ## Repo shape
-- Single Rust 2024 crate, not a workspace; use direct `cargo` commands (no Makefile/justfile/CI config in repo).
-- Backend-only MVP: no frontend, no WebSockets, and only responses proxying is implemented.
-- `src/main.rs` routes between `serve`, `migrate up`, and CLI API commands; `src/lib.rs::build_app` wires Axum `/health`, `/admin/*`, and proxy routes.
-- Postgres schema lives in `migrations/` and is embedded through `sqlx::migrate!("./migrations")`; both `cargo run -- migrate up` and `cargo run -- serve` apply migrations.
+
+- Single Rust 2024 crate, not a workspace; use direct `cargo` commands.
+- Local-first daemon: no frontend, PostgreSQL, or Docker dependency; Codex uses streaming HTTP or the local Responses WebSocket bridge.
+- `src/main.rs` handles `serve`, `migrate up`, and CLI API commands. `src/lib.rs::build_app` wires health, status, admin, and proxy routes.
+- SQLite migrations live in `migrations/` and are embedded with `sqlx::migrate!`. Both `cargo run -- migrate up` and `cargo run -- serve` apply them.
+- `packaging/systemd/codex-lb-rs.service` is a hardened systemd user unit. `scripts/install-user-service.sh` builds release mode, installs the binary/unit atomically, and enables/restarts the service.
 
 ## Local commands
-- Start DB: `docker compose up -d postgres` (override host port with `CODEX_LB_POSTGRES_PORT=55432`).
-- Local env/key setup: `cp .env.example .env && mkdir -p .local`; keep `CODEX_LB_ENCRYPTION_KEY_FILE` stable because changing it makes imported tokens unreadable.
-- Run app: `cargo run -- migrate up` then `cargo run -- serve`.
-- Normal checks: `cargo fmt --check`, `cargo check`, `cargo test`.
-- Check resolved config: `cargo run -- config check`.
 
-## CLI/API quirks
-- Admin CLI commands for `accounts`, `usage`, `logs`, and `settings` are thin HTTP clients; start the server first and pass `--admin-token` or set `CODEX_LB_ADMIN_TOKEN` when admin auth is enabled.
-- CLI base URL defaults to `http://127.0.0.1:2455`; override with `--base-url` or `CODEX_LB_BASE_URL`.
-- If `CODEX_LB_ADMIN_TOKEN` or `CODEX_LB_PROXY_API_TOKEN` is unset, the corresponding API is intentionally unauthenticated with only a startup warning.
-- Proxy routes are `/backend-api/codex/responses` and `/v1/responses`; model list stubs are `/backend-api/codex/models` and `/v1/models`.
+- Optional dev env: `cp .env.example .env && mkdir -p .local`.
+- Run: `cargo run -- migrate up` then `cargo run -- serve`; the explicit migration step is optional because `serve` also migrates.
+- Install/restart the user service: `./scripts/install-user-service.sh`.
+- Service logs: `journalctl --user -u codex-lb-rs.service -f`.
+- Checks: `cargo fmt --check`, `cargo check --all-targets`, `cargo test`.
+- Resolved high-level config: `cargo run -- config check`.
 
-## Tests and database safety
-- `cargo test` skips the destructive Postgres integration smoke unless `CODEX_LB_TEST_DATABASE_URL` is set.
-- Integration smoke applies migrations, truncates app tables, starts an in-process fake upstream, and covers admin/proxy auth, 429 failover, SSE usage logging, and usage summary aggregation.
-- Run it with a dedicated DB whose URL contains `test`:
-  `CODEX_LB_TEST_DATABASE_URL=postgres://codex_lb:codex_lb@127.0.0.1:5432/codex_lb_test cargo test --test postgres_proxy postgres_admin_and_proxy_failover_smoke -- --nocapture`
-- The integration test refuses URLs without `test` unless `CODEX_LB_ALLOW_DESTRUCTIVE_TEST_DB=1`; do not point it at a real/dev DB.
+## CLI and routes
 
-## Data/config gotchas
-- Runtime settings are rows in Postgres (`routing_strategy`, `proxy_max_attempts`, `rate_limit_cooldown_seconds`), updated via `cargo run -- --admin-token <token> settings set <key> <value>`; only `round_robin` routing is implemented.
-- Account import expects Codex/ChatGPT auth JSON with `tokens.idToken`, `tokens.accessToken`, and `tokens.refreshToken` (snake_case aliases also work); do not commit `.env`, `.local/encryption.key`, or imported `auth.json` files.
+- Account/status/admin commands are thin HTTP clients; start the daemon first. Their base URL defaults to `http://127.0.0.1:2455` and can be changed with `--base-url` or `CODEX_LB_BASE_URL`.
+- Account bootstrap supports `accounts login <label>`, `accounts import <path> --label <label>`, and `accounts import-opencode <path> --provider openai --label <label>`.
+- `accounts login` deliberately uses a label-specific `CODEX_HOME` below the app data directory so multiple device logins do not overwrite each other.
+- `POST /backend-api/codex/responses` and `POST /v1/responses` proxy streaming HTTP; `GET` on those paths upgrades the Responses WebSocket bridge. Compact/model routes remain HTTP-only.
+- Cached status routes are `/api/v1/status` and `/api/v1/status/waybar`; `status --waybar` emits a valid offline fallback even when the daemon cannot be reached.
+- Admin routes use `CODEX_LB_ADMIN_TOKEN` when configured. Proxy/model routes use `CODEX_LB_PROXY_API_TOKEN` when configured. Keep the default service loopback-only if either token is unset.
+
+## Tests
+
+- `cargo test` always runs the SQLite integration smoke against a temporary directory; no external database or destructive-test environment variable is needed.
+- The smoke starts an in-process fake upstream and covers SQLite pragmas/migrations, admin/proxy auth, account selection/failover, SSE and WebSocket usage logging, per-turn WebSocket eligibility, browser-origin rejection, and usage aggregation. Keep it self-contained.
+- Prefer focused unit tests for auth parsing, quota normalization, pace calculations, and setting bounds, plus the SQLite smoke for route/database behavior.
+
+## Data and behavior gotchas
+
+- Default state is `${XDG_DATA_HOME:-$HOME/.local/share}/codex-lb-rs/{codex-lb.sqlite,encryption.key}` outside the systemd unit; the unit uses systemd's private `%S/codex-lb-rs` state directory (normally `~/.local/state/codex-lb-rs`).
+- SQLite is configured for WAL, foreign keys, a busy timeout, and a deliberately small pool. Preserve that lean local profile unless measurements justify a change.
+- Tokens are AES-GCM encrypted but the database, key, imported auth JSON, and isolated login homes are still sensitive. Never log tokens or commit those files. Changing the key makes existing token rows unreadable.
+- Fresh databases default to `usage_weighted` routing. Runtime settings also include `proxy_max_attempts`, `rate_limit_cooldown_seconds`, `sticky_session_ttl_seconds`, and `usage_sample_retention_days`.
+- Quota windows are dynamic upstream data. Do not hard-code primary as 5 hours, secondary as 7 days, or assume every account/model has both windows.
+- Sticky routing stores a hash of the affinity key, not the raw session/conversation identifier. Ensure every selected-account path decrements its in-flight lease, including errors and disconnected streams.
+- The Waybar path must remain a cheap cached SQLite read; upstream usage refresh belongs in the background scheduler (default 120 seconds, minimum 30).
+- Provider configuration for Codex must be documented as user-level `~/.codex/config.toml`; project config cannot redirect auth/providers. Set `supports_websockets = true` only after the installed service includes the tested bridge.
+- Proxy routes reject every request carrying an `Origin` header. Preserve that defense unless proxy authentication becomes mandatory, because arbitrary webpages can otherwise reach loopback WebSockets without CORS protection.
