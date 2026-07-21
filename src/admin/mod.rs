@@ -65,10 +65,66 @@ async fn import_account(
     State(state): State<AppState>,
     Json(payload): Json<Value>,
 ) -> AppResult<Json<Value>> {
+    let label = payload
+        .get("label")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let auth_payload = payload.get("auth").cloned().unwrap_or(payload);
     let (auth, claims) =
-        parse_auth_json(payload).map_err(|err| AppError::BadRequest(err.to_string()))?;
-    let account = db::upsert_account(&state.pool, &state.crypto, auth, claims).await?;
-    Ok(Json(serde_json::json!({ "account": account })))
+        parse_auth_json(auth_payload).map_err(|err| AppError::BadRequest(err.to_string()))?;
+    let account = db::upsert_account(&state.pool, &state.crypto, auth, claims, label).await?;
+
+    let mut warnings = Vec::new();
+    let mut auth_ready = true;
+    let account = if account
+        .access_token_expires_at
+        .is_some_and(|expiry| expiry <= chrono::Utc::now() + chrono::Duration::minutes(5))
+    {
+        match upstream::refresh_account_tokens(
+            &state.pool,
+            &state.crypto,
+            &state.http,
+            &state.config,
+            account.id,
+        )
+        .await
+        {
+            Ok(account) => account,
+            Err(error) => {
+                let message = format!("initial token refresh failed: {error}");
+                db::mark_auth_failed(&state.pool, account.id, &message)
+                    .await
+                    .ok();
+                warnings.push(message);
+                auth_ready = false;
+                account
+            }
+        }
+    } else {
+        account
+    };
+    if auth_ready
+        && let Err(error) = upstream::refresh_account_usage(
+            &state.pool,
+            &state.crypto,
+            &state.http,
+            &state.config,
+            account.id,
+        )
+        .await
+    {
+        let message = format!("initial usage refresh failed: {error}");
+        db::mark_usage_error(&state.pool, account.id, &message)
+            .await
+            .ok();
+        warnings.push(message);
+    }
+    let account = db::get_account(&state.pool, account.id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("imported account disappeared".to_string()))?;
+    Ok(Json(
+        serde_json::json!({ "account": account, "warnings": warnings }),
+    ))
 }
 
 async fn update_account(
@@ -80,6 +136,7 @@ async fn update_account(
         &state.pool,
         id,
         payload.status,
+        payload.label,
         payload.email,
         payload.plan_type,
     )

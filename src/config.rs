@@ -16,14 +16,14 @@ pub struct Config {
     pub proxy_api_token: Option<String>,
     pub request_timeout: Duration,
     pub token_refresh_interval_days: i64,
+    pub usage_refresh_interval: Duration,
 }
 
 impl Config {
     pub fn from_env() -> Result<Self> {
         let _ = dotenvy::dotenv();
 
-        let database_url = env_var("CODEX_LB_DATABASE_URL")
-            .unwrap_or_else(|| "postgres://codex_lb:codex_lb@127.0.0.1:5432/codex_lb".to_string());
+        let database_url = env_var("CODEX_LB_DATABASE_URL").unwrap_or_else(default_database_url);
         let host = env_var("HOST").unwrap_or_else(|| "127.0.0.1".to_string());
         let port = env_var("PORT")
             .or_else(|| env_var("CODEX_LB_PORT"))
@@ -51,6 +51,13 @@ impl Config {
             .unwrap_or_else(|| "8".to_string())
             .parse::<i64>()
             .context("CODEX_LB_TOKEN_REFRESH_INTERVAL_DAYS must be an integer")?;
+        let usage_refresh_interval = Duration::from_secs(
+            env_var("CODEX_LB_USAGE_REFRESH_INTERVAL_SECONDS")
+                .unwrap_or_else(|| "120".to_string())
+                .parse::<u64>()
+                .context("CODEX_LB_USAGE_REFRESH_INTERVAL_SECONDS must be an integer")?
+                .max(30),
+        );
 
         Ok(Self {
             database_url,
@@ -65,6 +72,7 @@ impl Config {
             proxy_api_token: env_var("CODEX_LB_PROXY_API_TOKEN"),
             request_timeout,
             token_refresh_interval_days,
+            usage_refresh_interval,
         })
     }
 
@@ -77,6 +85,33 @@ impl Config {
     pub fn upstream_codex_responses_url(&self) -> String {
         format!(
             "{}/codex/responses",
+            self.upstream_base_url.trim_end_matches('/')
+        )
+    }
+
+    pub fn upstream_codex_responses_websocket_url(&self) -> Result<String> {
+        let url = self.upstream_codex_responses_url();
+        if let Some(rest) = url.strip_prefix("https://") {
+            Ok(format!("wss://{rest}"))
+        } else if let Some(rest) = url.strip_prefix("http://") {
+            Ok(format!("ws://{rest}"))
+        } else if url.starts_with("ws://") || url.starts_with("wss://") {
+            Ok(url)
+        } else {
+            anyhow::bail!("CODEX_LB_UPSTREAM_BASE_URL must use http(s) or ws(s)")
+        }
+    }
+
+    pub fn upstream_codex_compact_url(&self) -> String {
+        format!(
+            "{}/codex/responses/compact",
+            self.upstream_base_url.trim_end_matches('/')
+        )
+    }
+
+    pub fn upstream_codex_models_url(&self) -> String {
+        format!(
+            "{}/codex/models",
             self.upstream_base_url.trim_end_matches('/')
         )
     }
@@ -103,10 +138,24 @@ fn env_var(key: &str) -> Option<String> {
 }
 
 fn default_encryption_key_file() -> PathBuf {
-    let home = env::var_os("HOME")
+    default_data_dir().join("encryption.key")
+}
+
+fn default_database_url() -> String {
+    format!(
+        "sqlite://{}",
+        default_data_dir().join("codex-lb.sqlite").display()
+    )
+}
+
+fn default_data_dir() -> PathBuf {
+    env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".codex-lb-rs").join("encryption.key")
+        .or_else(|| {
+            env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("share"))
+        })
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("codex-lb-rs")
 }
 
 #[cfg(test)]
@@ -122,6 +171,16 @@ mod tests {
         assert_eq!(
             config.upstream_codex_responses_url(),
             "https://chatgpt.com/backend-api/codex/responses"
+        );
+    }
+
+    #[test]
+    fn upstream_websocket_url_rewrites_https_scheme() {
+        let config = config_with_upstream("https://chatgpt.com/backend-api/");
+
+        assert_eq!(
+            config.upstream_codex_responses_websocket_url().unwrap(),
+            "wss://chatgpt.com/backend-api/codex/responses"
         );
     }
 
@@ -147,7 +206,7 @@ mod tests {
 
     fn config_with_upstream(upstream_base_url: &str) -> Config {
         Config {
-            database_url: "postgres://example".to_string(),
+            database_url: "sqlite::memory:".to_string(),
             host: "127.0.0.1".to_string(),
             port: 2455,
             upstream_base_url: upstream_base_url.to_string(),
@@ -159,6 +218,7 @@ mod tests {
             proxy_api_token: None,
             request_timeout: Duration::from_secs(1),
             token_refresh_interval_days: 8,
+            usage_refresh_interval: Duration::from_secs(120),
         }
     }
 }

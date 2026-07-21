@@ -10,6 +10,8 @@ pub enum AppError {
     Unauthorized(String),
     #[error("not found: {0}")]
     NotFound(String),
+    #[error("temporarily unavailable: {0}")]
+    Unavailable(String),
     #[error("upstream error: {0}")]
     Upstream(String),
     #[error("database error: {0}")]
@@ -35,6 +37,7 @@ impl AppError {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
+            Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Upstream(_) => StatusCode::BAD_GATEWAY,
             Self::Database(_) | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -45,6 +48,7 @@ impl AppError {
             Self::BadRequest(_) => "bad_request",
             Self::Unauthorized(_) => "unauthorized",
             Self::NotFound(_) => "not_found",
+            Self::Unavailable(_) => "unavailable",
             Self::Upstream(_) => "upstream_error",
             Self::Database(_) => "database_error",
             Self::Internal(_) => "internal_error",

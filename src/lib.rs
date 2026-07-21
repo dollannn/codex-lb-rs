@@ -7,8 +7,12 @@ pub mod db;
 pub mod error;
 pub mod models;
 pub mod proxy;
+pub mod scheduler;
 pub mod state;
+pub mod status;
 pub mod upstream;
+pub mod usage;
+pub mod websocket;
 
 use axum::{Json, Router, extract::State, routing::get};
 use serde_json::Value;
@@ -20,6 +24,7 @@ pub fn build_app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .nest("/admin", admin::router(state.clone()))
+        .merge(status::router())
         .merge(proxy::router())
         .with_state(state)
         .layer(TraceLayer::new_for_http())

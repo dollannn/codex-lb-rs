@@ -8,6 +8,7 @@ use uuid::Uuid;
 pub struct Account {
     pub id: Uuid,
     pub chatgpt_account_id: Option<String>,
+    pub label: String,
     pub email: String,
     pub plan_type: String,
     #[serde(skip_serializing)]
@@ -17,6 +18,9 @@ pub struct Account {
     #[serde(skip_serializing)]
     pub encrypted_id_token: String,
     pub last_refresh_at: DateTime<Utc>,
+    pub access_token_expires_at: Option<DateTime<Utc>>,
+    pub last_usage_refresh_at: Option<DateTime<Utc>>,
+    pub last_usage_error: Option<String>,
     pub status: String,
     pub status_reason: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -27,17 +31,45 @@ pub struct Account {
 pub struct AccountSummary {
     pub id: Uuid,
     pub chatgpt_account_id: Option<String>,
+    pub label: String,
     pub email: String,
     pub plan_type: String,
     pub status: String,
     pub status_reason: Option<String>,
     pub last_refresh_at: DateTime<Utc>,
+    pub access_token_expires_at: Option<DateTime<Utc>>,
+    pub last_usage_refresh_at: Option<DateTime<Utc>>,
+    pub last_usage_error: Option<String>,
     pub created_at: DateTime<Utc>,
     pub latest_used_percent: Option<f64>,
     pub latest_reset_at: Option<DateTime<Utc>>,
     pub request_count: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
+    pub last_selected_at: Option<DateTime<Utc>>,
+    pub last_request_at: Option<DateTime<Utc>>,
+    pub cooldown_until: Option<DateTime<Utc>>,
+    pub inflight_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct UsageWindow {
+    pub account_id: Uuid,
+    pub quota_key: String,
+    pub quota_name: String,
+    pub source_slot: String,
+    pub window_kind: String,
+    pub used_percent: f64,
+    pub window_seconds: Option<i64>,
+    pub reset_at: Option<DateTime<Utc>>,
+    pub fetched_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct UsageSample {
+    pub used_percent: f64,
+    pub reset_at: Option<DateTime<Utc>>,
+    pub recorded_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, FromRow)]
@@ -69,6 +101,17 @@ pub struct RequestLog {
     pub created_at: DateTime<Utc>,
 }
 
+pub struct NewRequestLog<'a> {
+    pub request_id: &'a str,
+    pub account_id: Option<Uuid>,
+    pub model: Option<&'a str>,
+    pub status: &'a str,
+    pub error_code: Option<&'a str>,
+    pub error_message: Option<&'a str>,
+    pub usage: UsageData,
+    pub latency_ms: Option<i32>,
+}
+
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct SettingRow {
     pub key: String,
@@ -81,14 +124,18 @@ pub struct RuntimeSettings {
     pub routing_strategy: String,
     pub proxy_max_attempts: usize,
     pub rate_limit_cooldown_seconds: i64,
+    pub sticky_session_ttl_seconds: i64,
+    pub usage_sample_retention_days: i64,
 }
 
 impl Default for RuntimeSettings {
     fn default() -> Self {
         Self {
-            routing_strategy: "round_robin".to_string(),
+            routing_strategy: "usage_weighted".to_string(),
             proxy_max_attempts: 2,
             rate_limit_cooldown_seconds: 60,
+            sticky_session_ttl_seconds: 7 * 24 * 60 * 60,
+            usage_sample_retention_days: 30,
         }
     }
 }
@@ -116,6 +163,16 @@ impl RuntimeSettings {
                 if let Some(value) = json_i64(value) {
                     self.rate_limit_cooldown_seconds =
                         value.clamp(1, Self::MAX_RATE_LIMIT_COOLDOWN_SECONDS);
+                }
+            }
+            "sticky_session_ttl_seconds" => {
+                if let Some(value) = json_i64(value) {
+                    self.sticky_session_ttl_seconds = value.clamp(300, 30 * 24 * 60 * 60);
+                }
+            }
+            "usage_sample_retention_days" => {
+                if let Some(value) = json_i64(value) {
+                    self.usage_sample_retention_days = value.clamp(1, 365);
                 }
             }
             _ => {}
@@ -155,6 +212,7 @@ pub struct UsageData {
 #[derive(Debug, Deserialize)]
 pub struct AccountUpdateRequest {
     pub status: Option<String>,
+    pub label: Option<String>,
     pub email: Option<String>,
     pub plan_type: Option<String>,
 }

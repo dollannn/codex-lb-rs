@@ -1,5 +1,10 @@
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock, Weak},
+};
+
 use chrono::{DateTime, Utc};
-use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap};
 use serde::Deserialize;
 use serde_json::Value;
 use uuid::Uuid;
@@ -13,6 +18,10 @@ use crate::{
     models::{Account, SelectedAccount, UsageData, UsageSnapshot},
 };
 
+type RefreshMutex = tokio::sync::Mutex<()>;
+static REFRESH_LOCKS: LazyLock<tokio::sync::Mutex<HashMap<Uuid, Weak<RefreshMutex>>>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
+
 #[derive(Debug, Deserialize)]
 struct OAuthTokenPayload {
     access_token: Option<String>,
@@ -25,15 +34,25 @@ struct OAuthTokenPayload {
 }
 
 pub async fn refresh_account_tokens(
-    pool: &sqlx::PgPool,
+    pool: &sqlx::SqlitePool,
     crypto: &TokenCrypto,
     client: &reqwest::Client,
     config: &Config,
     account_id: Uuid,
 ) -> AppResult<Account> {
+    let observed = db::get_account(pool, account_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("account {account_id} not found")))?;
+    let refresh_lock = account_refresh_lock(account_id).await;
+    let _refresh_guard = refresh_lock.lock().await;
     let account = db::get_account(pool, account_id)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("account {account_id} not found")))?;
+    if account.encrypted_refresh_token != observed.encrypted_refresh_token
+        || account.encrypted_access_token != observed.encrypted_access_token
+    {
+        return Ok(account);
+    }
     let refresh_token = crypto.decrypt(&account.encrypted_refresh_token)?;
 
     let response = client
@@ -81,22 +100,22 @@ pub async fn refresh_account_tokens(
     };
     let claims = claims_from_auth(&auth);
 
-    db::update_account_tokens(
-        pool,
-        crypto,
-        account_id,
-        &access_token,
-        &refresh_token,
-        &id_token,
-        claims.chatgpt_account_id,
-        Some(claims.email),
-        Some(claims.plan_type),
-    )
-    .await
+    db::update_account_tokens(pool, crypto, account_id, &auth, claims).await
+}
+
+async fn account_refresh_lock(account_id: Uuid) -> Arc<RefreshMutex> {
+    let mut locks = REFRESH_LOCKS.lock().await;
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(&account_id).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(RefreshMutex::new(()));
+    locks.insert(account_id, Arc::downgrade(&lock));
+    lock
 }
 
 pub async fn refresh_account_usage(
-    pool: &sqlx::PgPool,
+    pool: &sqlx::SqlitePool,
     crypto: &TokenCrypto,
     client: &reqwest::Client,
     config: &Config,
@@ -106,45 +125,68 @@ pub async fn refresh_account_usage(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("account {account_id} not found")))?;
     let access_token = crypto.decrypt(&account.encrypted_access_token)?;
-    let raw = fetch_usage_raw(
+    let raw = match fetch_usage_raw(
         client,
         config,
         &access_token,
         account.chatgpt_account_id.as_deref(),
     )
-    .await?;
+    .await
+    {
+        Ok(raw) => raw,
+        Err(error) if is_auth_error(&error) => {
+            let refreshed =
+                refresh_account_tokens(pool, crypto, client, config, account_id).await?;
+            let access_token = crypto.decrypt(&refreshed.encrypted_access_token)?;
+            fetch_usage_raw(
+                client,
+                config,
+                &access_token,
+                refreshed.chatgpt_account_id.as_deref(),
+            )
+            .await?
+        }
+        Err(error) => return Err(error),
+    };
+    let fetched_at = Utc::now();
+    let windows = crate::usage::parse_usage_windows(&raw, fetched_at);
+    let plan_type = raw
+        .get("plan_type")
+        .or_else(|| raw.get("plan"))
+        .and_then(Value::as_str);
+    db::replace_usage_windows(pool, account.id, plan_type, fetched_at, &windows).await?;
     let (used_percent, reset_at) = parse_primary_usage_window(&raw);
     db::insert_usage_snapshot(pool, account.id, used_percent, None, None, reset_at, raw).await
 }
 
 pub async fn refresh_all_usage(
-    pool: &sqlx::PgPool,
+    pool: &sqlx::SqlitePool,
     crypto: &TokenCrypto,
     client: &reqwest::Client,
     config: &Config,
 ) -> AppResult<Vec<UsageSnapshot>> {
-    let accounts = sqlx::query_as::<_, Account>(
-        "SELECT * FROM accounts WHERE status = 'active' ORDER BY created_at ASC",
-    )
-    .fetch_all(pool)
-    .await?;
+    let accounts = db::active_accounts(pool).await?;
     let mut snapshots = Vec::with_capacity(accounts.len());
     for account in accounts {
-        let access_token = crypto.decrypt(&account.encrypted_access_token)?;
-        let raw = fetch_usage_raw(
-            client,
-            config,
-            &access_token,
-            account.chatgpt_account_id.as_deref(),
-        )
-        .await?;
-        let (used_percent, reset_at) = parse_primary_usage_window(&raw);
-        snapshots.push(
-            db::insert_usage_snapshot(pool, account.id, used_percent, None, None, reset_at, raw)
-                .await?,
-        );
+        match refresh_account_usage(pool, crypto, client, config, account.id).await {
+            Ok(snapshot) => snapshots.push(snapshot),
+            Err(error) => {
+                db::mark_usage_error(pool, account.id, &error.to_string())
+                    .await
+                    .ok();
+                tracing::warn!(
+                    account_id = %account.id,
+                    error = %error,
+                    "usage refresh failed"
+                );
+            }
+        }
     }
     Ok(snapshots)
+}
+
+fn is_auth_error(error: &AppError) -> bool {
+    matches!(error, AppError::Upstream(message) if message.contains("401") || message.contains("403"))
 }
 
 pub fn build_upstream_responses_request<'a>(
@@ -153,22 +195,94 @@ pub fn build_upstream_responses_request<'a>(
     selected: &'a SelectedAccount,
     body: bytes::Bytes,
     request_id: &'a str,
+    incoming_headers: &HeaderMap,
+    compact: bool,
 ) -> reqwest::RequestBuilder {
+    let url = if compact {
+        config.upstream_codex_compact_url()
+    } else {
+        config.upstream_codex_responses_url()
+    };
     let mut request = client
-        .post(config.upstream_codex_responses_url())
+        .post(url)
         .timeout(config.request_timeout)
         .header(
             AUTHORIZATION,
             format!("Bearer {}", selected.tokens.access_token),
         )
-        .header(ACCEPT, "text/event-stream")
+        .header(
+            ACCEPT,
+            if compact {
+                "application/json"
+            } else {
+                "text/event-stream"
+            },
+        )
         .header(CONTENT_TYPE, "application/json")
         .header("x-request-id", request_id)
         .body(body);
+    for (name, value) in incoming_headers {
+        if should_forward_request_header(name.as_str()) {
+            request = request.header(name, value);
+        }
+    }
     if let Some(account_id) = selected.account.chatgpt_account_id.as_deref() {
         request = request.header("chatgpt-account-id", account_id);
     }
     request
+}
+
+pub fn build_upstream_models_request<'a>(
+    client: &'a reqwest::Client,
+    config: &'a Config,
+    selected: &'a SelectedAccount,
+    request_id: &'a str,
+    incoming_headers: &HeaderMap,
+    raw_query: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let mut url = config.upstream_codex_models_url();
+    if let Some(query) = raw_query.filter(|query| !query.is_empty()) {
+        url.push('?');
+        url.push_str(query);
+    }
+    let mut request = client
+        .get(url)
+        .timeout(config.request_timeout)
+        .header(
+            AUTHORIZATION,
+            format!("Bearer {}", selected.tokens.access_token),
+        )
+        .header(ACCEPT, "application/json")
+        .header("x-request-id", request_id);
+    for (name, value) in incoming_headers {
+        if should_forward_request_header(name.as_str()) {
+            request = request.header(name, value);
+        }
+    }
+    if let Some(account_id) = selected.account.chatgpt_account_id.as_deref() {
+        request = request.header("chatgpt-account-id", account_id);
+    }
+    request
+}
+
+fn should_forward_request_header(name: &str) -> bool {
+    matches!(
+        name,
+        "user-agent"
+            | "originator"
+            | "openai-beta"
+            | "accept-language"
+            | "session_id"
+            | "x-session-id"
+            | "x-request-id"
+            | "x-codex-session-id"
+            | "x-codex-conversation-id"
+            | "x-codex-turn-state"
+            | "x-codex-turn-metadata"
+            | "x-codex-client-version"
+            | "x-codex-service-tier"
+            | "x-openai-client-user-agent"
+    ) || name.starts_with("x-stainless-")
 }
 
 pub fn model_from_body(body: &[u8]) -> Option<String> {
@@ -196,6 +310,18 @@ pub fn extract_usage_from_sse(buffer: &str) -> UsageData {
             merge_usage(&mut usage, &value);
         }
     }
+    if usage.input_tokens.is_none()
+        && usage.output_tokens.is_none()
+        && let Some(value) = last_named_json_object(buffer, "usage")
+    {
+        merge_usage_fields(&mut usage, &value);
+    }
+    usage
+}
+
+pub fn extract_usage_from_json(value: &Value) -> UsageData {
+    let mut usage = UsageData::default();
+    merge_usage(&mut usage, value);
     usage
 }
 
@@ -206,25 +332,76 @@ fn merge_usage(usage: &mut UsageData, value: &Value) {
         value.get("item").and_then(|v| v.get("usage")),
     ];
     for candidate in candidates.into_iter().flatten() {
-        if let Some(input) = candidate.get("input_tokens").and_then(Value::as_i64) {
-            usage.input_tokens = Some(input);
-        }
-        if let Some(output) = candidate.get("output_tokens").and_then(Value::as_i64) {
-            usage.output_tokens = Some(output);
-        }
-        if let Some(cached) = candidate
-            .pointer("/input_tokens_details/cached_tokens")
-            .and_then(Value::as_i64)
-        {
-            usage.cached_input_tokens = Some(cached);
-        }
-        if let Some(reasoning) = candidate
-            .pointer("/output_tokens_details/reasoning_tokens")
-            .and_then(Value::as_i64)
-        {
-            usage.reasoning_tokens = Some(reasoning);
+        merge_usage_fields(usage, candidate);
+    }
+}
+
+fn merge_usage_fields(usage: &mut UsageData, candidate: &Value) {
+    if let Some(input) = candidate.get("input_tokens").and_then(Value::as_i64) {
+        usage.input_tokens = Some(input);
+    }
+    if let Some(output) = candidate.get("output_tokens").and_then(Value::as_i64) {
+        usage.output_tokens = Some(output);
+    }
+    if let Some(cached) = candidate
+        .pointer("/input_tokens_details/cached_tokens")
+        .and_then(Value::as_i64)
+    {
+        usage.cached_input_tokens = Some(cached);
+    }
+    if let Some(reasoning) = candidate
+        .pointer("/output_tokens_details/reasoning_tokens")
+        .and_then(Value::as_i64)
+    {
+        usage.reasoning_tokens = Some(reasoning);
+    }
+}
+
+fn last_named_json_object(buffer: &str, name: &str) -> Option<Value> {
+    let needle = format!("\"{name}\"");
+    for (key_start, _) in buffer.rmatch_indices(&needle) {
+        let after_key = &buffer[key_start + needle.len()..];
+        let Some(colon) = after_key.find(':') else {
+            continue;
+        };
+        let Some(relative_object) = after_key[colon + 1..].find('{') else {
+            continue;
+        };
+        let object_offset = relative_object + colon + 1;
+        let object_start = key_start + needle.len() + object_offset;
+        let bytes = buffer.as_bytes();
+        let mut depth = 0_u32;
+        let mut in_string = false;
+        let mut escaped = false;
+        for index in object_start..bytes.len() {
+            let byte = bytes[index];
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match byte {
+                b'"' => in_string = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        if let Ok(value) = serde_json::from_slice(&bytes[object_start..=index]) {
+                            return Some(value);
+                        }
+                        break;
+                    }
+                }
+                _ => {}
+            }
         }
     }
+    None
 }
 
 async fn fetch_usage_raw(
@@ -245,15 +422,22 @@ async fn fetch_usage_raw(
         .await
         .map_err(|err| AppError::Upstream(format!("usage request failed: {err}")))?;
     let status = response.status();
-    let raw = response
-        .json::<Value>()
+    let text = response
+        .text()
         .await
-        .map_err(|err| AppError::Upstream(format!("invalid usage response: {err}")))?;
+        .map_err(|err| AppError::Upstream(format!("failed to read usage response: {err}")))?;
+    let raw = serde_json::from_str::<Value>(&text)
+        .unwrap_or_else(|_| Value::String(text.chars().take(1_000).collect()));
     if !status.is_success() {
         return Err(AppError::Upstream(format!(
             "usage request failed ({status}): {}",
             raw
         )));
+    }
+    if raw.is_string() {
+        return Err(AppError::Upstream(
+            "usage response was not valid JSON".to_string(),
+        ));
     }
     Ok(raw)
 }
@@ -323,6 +507,22 @@ mod tests {
         assert_eq!(usage.output_tokens, Some(5));
         assert_eq!(usage.cached_input_tokens, Some(3));
         assert_eq!(usage.reasoning_tokens, Some(2));
+    }
+
+    #[test]
+    fn extract_usage_from_truncated_terminal_event_uses_usage_tail() {
+        let usage = extract_usage_from_sse(concat!(
+            "...truncated response output...\"usage\":{",
+            "\"input_tokens\":101,\"output_tokens\":7,",
+            "\"input_tokens_details\":{\"cached_tokens\":80},",
+            "\"output_tokens_details\":{\"reasoning_tokens\":4}}}}\n\n",
+            "data: [DONE]\n\n",
+        ));
+
+        assert_eq!(usage.input_tokens, Some(101));
+        assert_eq!(usage.output_tokens, Some(7));
+        assert_eq!(usage.cached_input_tokens, Some(80));
+        assert_eq!(usage.reasoning_tokens, Some(4));
     }
 
     #[test]

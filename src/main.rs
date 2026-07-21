@@ -11,7 +11,7 @@ use codex_lb_rs::{
     state::AppState,
 };
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     init_tracing();
     let _ = dotenvy::dotenv();
@@ -39,6 +39,7 @@ async fn migrate() -> Result<()> {
     let config = Config::from_env()?;
     let pool = db::connect(&config.database_url).await?;
     db::run_migrations(&pool).await?;
+    db::reset_inflight(&pool).await?;
     println!("migrations applied");
     Ok(())
 }
@@ -48,15 +49,18 @@ async fn serve(config: Config) -> Result<()> {
     let crypto = TokenCrypto::load_or_create(&config.encryption_key_file).await?;
     let pool = db::connect(&config.database_url).await?;
     db::run_migrations(&pool).await?;
+    db::reset_inflight(&pool).await?;
 
-    if config.admin_token.is_none() {
-        tracing::warn!("CODEX_LB_ADMIN_TOKEN is not set; admin API will be unauthenticated");
-    }
-    if config.proxy_api_token.is_none() {
-        tracing::warn!("CODEX_LB_PROXY_API_TOKEN is not set; proxy API will be unauthenticated");
+    if !addr.ip().is_loopback()
+        && (config.admin_token.is_none() || config.proxy_api_token.is_none())
+    {
+        anyhow::bail!(
+            "refusing a non-loopback listener without both CODEX_LB_ADMIN_TOKEN and CODEX_LB_PROXY_API_TOKEN"
+        );
     }
 
     let state = AppState::new(config, pool, crypto);
+    let _scheduler = codex_lb_rs::scheduler::spawn(state.clone());
     let app = build_app(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
