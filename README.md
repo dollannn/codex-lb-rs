@@ -43,15 +43,15 @@ The unit binds only to `127.0.0.1` by default and applies a restrictive systemd 
 
 ## Add accounts
 
-Account labels are the stable, non-sensitive names shown in status output and Waybar. Names such as `personal` and `work` are recommended.
+Account labels are stable, non-sensitive names shown in status output and Waybar. Neutral names such as `account-a` and `account-b` work well.
 
 ### Log in once per account
 
 This runs Codex's device login in a separate `CODEX_HOME` for each label, then imports the resulting credentials into the daemon:
 
 ```bash
-codex-lb-rs accounts login personal
-codex-lb-rs accounts login work
+codex-lb-rs accounts login account-a
+codex-lb-rs accounts login account-b
 ```
 
 The isolated login homes live under `${XDG_DATA_HOME:-$HOME/.local/share}/codex-lb-rs/login-homes/`. They prevent one login from replacing another account's Codex auth file.
@@ -61,7 +61,7 @@ The isolated login homes live under `${XDG_DATA_HOME:-$HOME/.local/share}/codex-
 An existing Codex auth file can be imported without another login:
 
 ```bash
-codex-lb-rs accounts import ~/.codex/auth.json --label work
+codex-lb-rs accounts import ~/.codex/auth.json --label account-a
 ```
 
 An existing OpenCode OAuth slot can also be imported once:
@@ -70,7 +70,7 @@ An existing OpenCode OAuth slot can also be imported once:
 codex-lb-rs accounts import-opencode \
   ~/.local/share/opencode/auth.json \
   --provider openai \
-  --label personal
+  --label account-b
 ```
 
 Importing immediately attempts an upstream token/usage refresh. A stale access token is fine when its refresh token is still valid; warnings in the import response indicate when a fresh device login is required.

@@ -81,7 +81,7 @@ pub enum AccountsCommand {
     List,
     Import {
         path: PathBuf,
-        /// Stable display name such as "personal" or "work".
+        /// Stable display name such as "account-a" or "account-b".
         #[arg(long)]
         label: Option<String>,
     },
