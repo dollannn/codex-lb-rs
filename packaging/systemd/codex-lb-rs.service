@@ -1,0 +1,43 @@
+[Unit]
+Description=Codex multi-account load balancer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/codex-lb-rs serve
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=30s
+UMask=0077
+
+# Keep the SQLite database and generated encryption key in private,
+# systemd-managed state rather than depending on the launch directory.
+StateDirectory=codex-lb-rs
+StateDirectoryMode=0700
+WorkingDirectory=%S/codex-lb-rs
+Environment=HOST=127.0.0.1
+Environment=CODEX_LB_DATABASE_URL=sqlite://%S/codex-lb-rs/codex-lb.sqlite
+Environment=CODEX_LB_ENCRYPTION_KEY_FILE=%S/codex-lb-rs/encryption.key
+
+# The daemon needs its state directory plus loopback listening, DNS, and
+# outbound HTTPS. It does not need to modify the rest of the host.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=default.target
