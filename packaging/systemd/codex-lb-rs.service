@@ -8,7 +8,9 @@ Type=exec
 ExecStart=%h/.local/bin/codex-lb-rs serve
 Restart=on-failure
 RestartSec=2s
-TimeoutStopSec=30s
+# WebSocket clients receive close code 1012 and reconnect on the next turn.
+# Keep a hard bound in case an HTTP stream or unexpected task does not drain.
+TimeoutStopSec=3s
 UMask=0077
 
 # Keep the SQLite database and generated encryption key in private,

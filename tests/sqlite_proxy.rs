@@ -146,7 +146,8 @@ async fn sqlite_admin_and_proxy_failover_smoke() -> Result<()> {
     assert_eq!(recovered.cooldown_until, None);
     assert_eq!(recovered.cooldown_reason, None);
 
-    let app = build_app(AppState::new(config, pool.clone(), crypto.clone()));
+    let state = AppState::new(config, pool.clone(), crypto.clone());
+    let app = build_app(state.clone());
     let app_server = TestServer::start(app).await?;
     let client = reqwest::Client::new();
 
@@ -509,6 +510,7 @@ async fn sqlite_admin_and_proxy_failover_smoke() -> Result<()> {
         invalid_session_hash.status(),
         reqwest::StatusCode::BAD_REQUEST
     );
+
     let authorizations = fake_upstream.authorizations().await;
     assert_eq!(
         &authorizations[authorizations.len() - 3..],
@@ -518,6 +520,25 @@ async fn sqlite_admin_and_proxy_failover_smoke() -> Result<()> {
             "Bearer good-access"
         ]
     );
+
+    let (mut restart_websocket, restart_response) =
+        connect_async(proxy_websocket_request(&app_server.base_url)?).await?;
+    assert_eq!(restart_response.status(), StatusCode::SWITCHING_PROTOCOLS);
+    let shutdown_started = std::time::Instant::now();
+    state.signal_shutdown();
+    let restart_close = tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(message) = restart_websocket.next().await {
+            if let ClientWebSocketMessage::Close(frame) = message? {
+                return Ok::<_, anyhow::Error>(frame);
+            }
+        }
+        anyhow::bail!("WebSocket ended without a service-restart close frame")
+    })
+    .await??
+    .expect("service-restart close frame");
+    assert_eq!(u16::from(restart_close.code), 1012);
+    assert_eq!(restart_close.reason, "service restart");
+    assert!(shutdown_started.elapsed() < Duration::from_secs(2));
 
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {

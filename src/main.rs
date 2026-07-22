@@ -61,17 +61,18 @@ async fn serve(config: Config) -> Result<()> {
 
     let state = AppState::new(config, pool, crypto);
     let _scheduler = codex_lb_rs::scheduler::spawn(state.clone());
+    let shutdown_state = state.clone();
     let app = build_app(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "codex-lb-rs listening");
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(shutdown_state))
         .await?;
     Ok(())
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(state: AppState) {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };
@@ -90,6 +91,7 @@ async fn shutdown_signal() {
         _ = ctrl_c => {},
         _ = terminate => {},
     }
+    state.signal_shutdown();
 }
 
 fn init_tracing() {

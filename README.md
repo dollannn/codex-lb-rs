@@ -25,6 +25,8 @@ The service is restarted on failure and starts with the user's systemd session. 
 - `codex-lb.sqlite` — accounts, current quotas, usage samples, affinity, and request logs;
 - `encryption.key` — AES-GCM key used to encrypt OAuth tokens in the database.
 
+Service restarts are bounded to three seconds. Before exiting, the daemon sends connected Responses WebSocket clients close code `1012 Service Restart`; Codex keeps its local thread and reconnects instead of waiting for the old socket's full lifetime. A response that is actively streaming during the restart can still need a retry, but the Codex session itself is not deleted or reset.
+
 Useful service commands:
 
 ```bash

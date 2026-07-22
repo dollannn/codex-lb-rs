@@ -274,6 +274,8 @@ async fn bridge(
     affinity: Option<AffinityKey>,
 ) {
     let mut active_turn: Option<ActiveTurn> = None;
+    let mut shutdown = state.subscribe_shutdown();
+    let mut service_restart = false;
     let idle_timeout = state.config.request_timeout;
     let write_timeout = idle_timeout.min(std::time::Duration::from_secs(30));
 
@@ -289,7 +291,18 @@ async fn bridge(
             }
         };
         tokio::pin!(hard_turn_timeout);
+        let shutdown_requested = async {
+            if *shutdown.borrow() {
+                return;
+            }
+            let _ = shutdown.changed().await;
+        };
+        tokio::pin!(shutdown_requested);
         tokio::select! {
+            _ = &mut shutdown_requested => {
+                service_restart = true;
+                break "local service restart requested";
+            }
             _ = &mut hard_turn_timeout => {
                 break "WebSocket request exceeded the configured request budget";
             }
@@ -315,6 +328,7 @@ async fn bridge(
                             &state,
                             account_id,
                             previous,
+                            "websocket_disconnected",
                             "a new WebSocket request started before the previous request completed",
                         ).await;
                     }
@@ -403,7 +417,28 @@ async fn bridge(
     };
 
     if let Some(turn) = active_turn {
-        finish_disconnected_turn(&state, account_id, turn, disconnect_message).await;
+        let error_code = if service_restart {
+            "service_restart"
+        } else {
+            "websocket_disconnected"
+        };
+        finish_disconnected_turn(&state, account_id, turn, error_code, disconnect_message).await;
+    }
+    if service_restart {
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.send(ClientMessage::Close(Some(ClientCloseFrame {
+                code: 1012,
+                reason: "service restart".into(),
+            }))),
+        )
+        .await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream_socket.close(None),
+        )
+        .await;
+        return;
     }
     let _ = tokio::time::timeout(write_timeout, upstream_socket.close(None)).await;
     let _ = tokio::time::timeout(write_timeout, client.close()).await;
@@ -543,6 +578,7 @@ async fn finish_disconnected_turn(
     state: &AppState,
     account_id: Uuid,
     turn: ActiveTurn,
+    error_code: &str,
     message: &str,
 ) {
     persist_turn(
@@ -550,7 +586,7 @@ async fn finish_disconnected_turn(
         account_id,
         &turn,
         "error",
-        Some("websocket_disconnected"),
+        Some(error_code),
         Some(message),
         UsageData::default(),
     )
