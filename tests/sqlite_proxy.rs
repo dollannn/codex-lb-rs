@@ -25,7 +25,7 @@ use codex_lb_rs::{
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use sqlx::SqlitePool;
+use sqlx::{SqlitePool, migrate::Migrate};
 use tokio::{net::TcpListener, sync::Mutex, task::JoinHandle};
 use tokio_tungstenite::{
     connect_async,
@@ -289,11 +289,35 @@ async fn sqlite_admin_and_proxy_failover_smoke() -> Result<()> {
     assert!(logs.iter().any(|log| {
         log.account_id == Some(good_account)
             && log.status == "success"
-            && log.input_tokens == Some(7)
+            && log.input_tokens == Some(1_200)
             && log.output_tokens == Some(11)
-            && log.cached_input_tokens == Some(2)
+            && log.cached_input_tokens == Some(200)
+            && log.cache_write_input_tokens == Some(100)
             && log.reasoning_tokens == Some(3)
+            && log.effective_model.as_deref() == Some("gpt-5.6-sol")
+            && log.effective_service_tier.as_deref() == Some("default")
+            && log.api_cost_status.as_deref() == Some("complete")
+            && log.api_cost_lower_nano_usd == Some(5_555_000)
+            && log.api_cost_upper_nano_usd == Some(5_555_000)
     }));
+
+    let accounts = db::list_accounts(&pool).await?;
+    let good_summary = accounts
+        .iter()
+        .find(|account| account.id == good_account)
+        .expect("good account summary");
+    assert_eq!(good_summary.cached_input_tokens, 200);
+    assert_eq!(good_summary.observed_cache_write_input_tokens, 100);
+    assert_eq!(good_summary.api_cost_lower_nano_usd, 5_555_000);
+    assert_eq!(good_summary.api_cost_upper_nano_usd, 5_555_000);
+    assert_eq!(good_summary.api_cost_complete_request_count, 1);
+    assert_eq!(good_summary.api_cost_partial_request_count, 0);
+    assert_eq!(good_summary.api_cost_unpriced_request_count, 0);
+    let rate_limited_summary = accounts
+        .iter()
+        .find(|account| account.id == rate_limited_account)
+        .expect("rate-limited account summary");
+    assert_eq!(rate_limited_summary.api_cost_unpriced_request_count, 1);
 
     let summary = db::usage_summary(&pool).await?;
     assert_eq!(summary.account_count, 2);
@@ -301,7 +325,7 @@ async fn sqlite_admin_and_proxy_failover_smoke() -> Result<()> {
     assert_eq!(summary.request_count, 2);
     assert_eq!(summary.successful_request_count, 1);
     assert_eq!(summary.failed_request_count, 1);
-    assert_eq!(summary.input_tokens, 7);
+    assert_eq!(summary.input_tokens, 1_200);
     assert_eq!(summary.output_tokens, 11);
 
     let compact: Value = client
@@ -470,10 +494,22 @@ async fn sqlite_admin_and_proxy_failover_smoke() -> Result<()> {
     assert_eq!(websocket_log.account_id, Some(good_account));
     assert_eq!(websocket_log.model.as_deref(), Some("gpt-ws-test"));
     assert_eq!(websocket_log.status, "success");
-    assert_eq!(websocket_log.input_tokens, Some(13));
+    assert_eq!(websocket_log.input_tokens, Some(1_300));
     assert_eq!(websocket_log.output_tokens, Some(17));
-    assert_eq!(websocket_log.cached_input_tokens, Some(5));
+    assert_eq!(websocket_log.cached_input_tokens, Some(500));
+    assert_eq!(websocket_log.cache_write_input_tokens, Some(200));
     assert_eq!(websocket_log.reasoning_tokens, Some(7));
+    assert_eq!(
+        websocket_log.effective_model.as_deref(),
+        Some("gpt-5.6-sol")
+    );
+    assert_eq!(
+        websocket_log.effective_service_tier.as_deref(),
+        Some("default")
+    );
+    assert_eq!(websocket_log.api_cost_status.as_deref(), Some("complete"));
+    assert_eq!(websocket_log.api_cost_lower_nano_usd, Some(5_010_000));
+    assert_eq!(websocket_log.api_cost_upper_nano_usd, Some(5_010_000));
 
     let session_hash = db::affinity_hash("session_id", "integration-session");
     let session_routes: Value = client
@@ -558,6 +594,107 @@ async fn sqlite_admin_and_proxy_failover_smoke() -> Result<()> {
 
     drop(app_server);
     pool.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn migration_backfills_historical_cost_as_cache_write_range() -> Result<()> {
+    let storage = TestStorage::new();
+    let database_url = storage.database_url();
+    let pool = db::connect(&database_url).await?;
+    migrate_before_api_cost(&pool).await?;
+    let crypto = TokenCrypto::load_or_create(&storage.key_path).await?;
+    let account_id = insert_account(
+        &pool,
+        &crypto,
+        "historical-access",
+        "acct-historical",
+        "historical@example.com",
+    )
+    .await?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO request_logs (
+            request_id, account_id, model, status, input_tokens, output_tokens,
+            cached_input_tokens, reasoning_tokens
+        ) VALUES ('historical-request', $1, 'gpt-5.6-sol', 'success', 1200, 11, 200, 3)
+        "#,
+    )
+    .bind(account_id)
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        r#"
+        UPDATE account_runtime_state
+        SET request_count = 1, successful_request_count = 1,
+            input_tokens = 1200, output_tokens = 11
+        WHERE account_id = $1
+        "#,
+    )
+    .bind(account_id)
+    .execute(&pool)
+    .await?;
+
+    db::run_migrations(&pool).await?;
+    let pending_account = db::list_accounts(&pool)
+        .await?
+        .into_iter()
+        .find(|account| account.id == account_id)
+        .expect("pending historical account summary");
+    assert_eq!(pending_account.api_cost_complete_request_count, 0);
+    assert_eq!(pending_account.api_cost_partial_request_count, 0);
+    assert_eq!(pending_account.api_cost_unpriced_request_count, 1);
+
+    let first_batch = db::backfill_api_costs_batch(&pool, 1).await?;
+    assert_eq!(first_batch.selected, 1);
+    assert_eq!(first_batch.updated, 1);
+    let finished_batch = db::backfill_api_costs_batch(&pool, 1).await?;
+    assert_eq!(finished_batch.selected, 0);
+    assert_eq!(finished_batch.updated, 0);
+    assert_eq!(db::backfill_api_costs(&pool).await?, 0);
+
+    let log = db::list_request_logs(
+        &pool,
+        LogsQuery {
+            limit: Some(1),
+            offset: None,
+        },
+    )
+    .await?
+    .pop()
+    .expect("backfilled request log");
+    assert_eq!(log.api_cost_status.as_deref(), Some("missing_cache_write"));
+    assert_eq!(log.api_cost_lower_nano_usd, Some(5_430_000));
+    assert_eq!(log.api_cost_upper_nano_usd, Some(6_680_000));
+
+    let account = db::list_accounts(&pool)
+        .await?
+        .into_iter()
+        .find(|account| account.id == account_id)
+        .expect("historical account summary");
+    assert_eq!(account.cached_input_tokens, 200);
+    assert_eq!(account.observed_cache_write_input_tokens, 0);
+    assert_eq!(account.api_cost_lower_nano_usd, 5_430_000);
+    assert_eq!(account.api_cost_upper_nano_usd, 6_680_000);
+    assert_eq!(account.api_cost_complete_request_count, 0);
+    assert_eq!(account.api_cost_partial_request_count, 1);
+    assert_eq!(account.api_cost_unpriced_request_count, 0);
+
+    Ok(())
+}
+
+async fn migrate_before_api_cost(pool: &SqlitePool) -> Result<()> {
+    let migration_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let migrator = sqlx::migrate::Migrator::new(migration_dir.as_path()).await?;
+    let mut connection = pool.acquire().await?;
+    connection.ensure_migrations_table().await?;
+    for migration in migrator
+        .iter()
+        .filter(|migration| migration.version < 202607220002)
+    {
+        connection.apply(migration).await?;
+    }
     Ok(())
 }
 
@@ -740,7 +877,7 @@ async fn fake_responses(
             .into_response(),
         "Bearer good-access" => (
             [(header::CONTENT_TYPE, "text/event-stream")],
-            "data: {\"response\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":11,\"input_tokens_details\":{\"cached_tokens\":2},\"output_tokens_details\":{\"reasoning_tokens\":3}}}}\n\ndata: [DONE]\n\n",
+            "data: {\"response\":{\"model\":\"gpt-5.6-sol\",\"service_tier\":\"default\",\"usage\":{\"input_tokens\":1200,\"output_tokens\":11,\"input_tokens_details\":{\"cached_tokens\":200,\"cache_write_tokens\":100},\"output_tokens_details\":{\"reasoning_tokens\":3}}}}\n\ndata: [DONE]\n\n",
         )
             .into_response(),
         _ => (StatusCode::UNAUTHORIZED, "unexpected token").into_response(),
@@ -794,10 +931,12 @@ async fn fake_responses_websocket(
                 "type": "response.completed",
                 "response": {
                     "id": "resp-ws-test",
+                    "model": "gpt-5.6-sol",
+                    "service_tier": "default",
                     "usage": {
-                        "input_tokens": 13,
+                        "input_tokens": 1300,
                         "output_tokens": 17,
-                        "input_tokens_details": {"cached_tokens": 5},
+                        "input_tokens_details": {"cached_tokens": 500, "cache_write_tokens": 200},
                         "output_tokens_details": {"reasoning_tokens": 7}
                     }
                 }

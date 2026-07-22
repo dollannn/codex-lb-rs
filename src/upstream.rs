@@ -326,6 +326,7 @@ pub fn extract_usage_from_json(value: &Value) -> UsageData {
 }
 
 fn merge_usage(usage: &mut UsageData, value: &Value) {
+    merge_response_metadata(usage, value);
     let candidates = [
         value.get("usage"),
         value.get("response").and_then(|v| v.get("usage")),
@@ -349,11 +350,27 @@ fn merge_usage_fields(usage: &mut UsageData, candidate: &Value) {
     {
         usage.cached_input_tokens = Some(cached);
     }
+    if let Some(cache_write) = candidate
+        .pointer("/input_tokens_details/cache_write_tokens")
+        .and_then(Value::as_i64)
+    {
+        usage.cache_write_input_tokens = Some(cache_write);
+    }
     if let Some(reasoning) = candidate
         .pointer("/output_tokens_details/reasoning_tokens")
         .and_then(Value::as_i64)
     {
         usage.reasoning_tokens = Some(reasoning);
+    }
+}
+
+fn merge_response_metadata(usage: &mut UsageData, value: &Value) {
+    let response = value.get("response").unwrap_or(value);
+    if let Some(model) = response.get("model").and_then(Value::as_str) {
+        usage.effective_model = Some(model.to_string());
+    }
+    if let Some(service_tier) = response.get("service_tier").and_then(Value::as_str) {
+        usage.effective_service_tier = Some(service_tier.to_string());
     }
 }
 
@@ -484,7 +501,10 @@ pub fn should_refresh(last_refresh_at: DateTime<Utc>, interval_days: i64) -> boo
 mod tests {
     use serde_json::json;
 
-    use super::{extract_usage_from_sse, model_from_body, parse_primary_usage_window};
+    use super::{
+        extract_usage_from_json, extract_usage_from_sse, model_from_body,
+        parse_primary_usage_window,
+    };
 
     #[test]
     fn model_from_body_reads_model_field() {
@@ -497,8 +517,9 @@ mod tests {
     fn extract_usage_from_sse_reads_nested_response_usage() {
         let usage = extract_usage_from_sse(concat!(
             "event: response.completed\n",
-            "data: {\"response\":{\"usage\":{\"input_tokens\":12,\"output_tokens\":5,",
-            "\"input_tokens_details\":{\"cached_tokens\":3},",
+            "data: {\"response\":{\"model\":\"gpt-5.6-sol-2026-07-01\",",
+            "\"service_tier\":\"priority\",\"usage\":{\"input_tokens\":12,\"output_tokens\":5,",
+            "\"input_tokens_details\":{\"cached_tokens\":3,\"cache_write_tokens\":4},",
             "\"output_tokens_details\":{\"reasoning_tokens\":2}}}}\n\n",
             "data: [DONE]\n\n",
         ));
@@ -506,7 +527,38 @@ mod tests {
         assert_eq!(usage.input_tokens, Some(12));
         assert_eq!(usage.output_tokens, Some(5));
         assert_eq!(usage.cached_input_tokens, Some(3));
+        assert_eq!(usage.cache_write_input_tokens, Some(4));
         assert_eq!(usage.reasoning_tokens, Some(2));
+        assert_eq!(
+            usage.effective_model.as_deref(),
+            Some("gpt-5.6-sol-2026-07-01")
+        );
+        assert_eq!(usage.effective_service_tier.as_deref(), Some("priority"));
+    }
+
+    #[test]
+    fn extract_usage_from_json_reads_top_level_response_metadata() {
+        let usage = extract_usage_from_json(&json!({
+            "model": "gpt-5.6-terra",
+            "service_tier": "default",
+            "usage": {
+                "input_tokens": 20,
+                "output_tokens": 6,
+                "input_tokens_details": {
+                    "cached_tokens": 8,
+                    "cache_write_tokens": 5
+                },
+                "output_tokens_details": {"reasoning_tokens": 1}
+            }
+        }));
+
+        assert_eq!(usage.input_tokens, Some(20));
+        assert_eq!(usage.output_tokens, Some(6));
+        assert_eq!(usage.cached_input_tokens, Some(8));
+        assert_eq!(usage.cache_write_input_tokens, Some(5));
+        assert_eq!(usage.reasoning_tokens, Some(1));
+        assert_eq!(usage.effective_model.as_deref(), Some("gpt-5.6-terra"));
+        assert_eq!(usage.effective_service_tier.as_deref(), Some("default"));
     }
 
     #[test]
@@ -514,7 +566,7 @@ mod tests {
         let usage = extract_usage_from_sse(concat!(
             "...truncated response output...\"usage\":{",
             "\"input_tokens\":101,\"output_tokens\":7,",
-            "\"input_tokens_details\":{\"cached_tokens\":80},",
+            "\"input_tokens_details\":{\"cached_tokens\":80,\"cache_write_tokens\":8},",
             "\"output_tokens_details\":{\"reasoning_tokens\":4}}}}\n\n",
             "data: [DONE]\n\n",
         ));
@@ -522,6 +574,7 @@ mod tests {
         assert_eq!(usage.input_tokens, Some(101));
         assert_eq!(usage.output_tokens, Some(7));
         assert_eq!(usage.cached_input_tokens, Some(80));
+        assert_eq!(usage.cache_write_input_tokens, Some(8));
         assert_eq!(usage.reasoning_tokens, Some(4));
     }
 

@@ -47,3 +47,36 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
         }
     })
 }
+
+pub fn spawn_api_cost_backfill(state: AppState) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut shutdown = state.subscribe_shutdown();
+        let mut total = 0_u64;
+        loop {
+            let result = tokio::select! {
+                _ = shutdown.changed() => return,
+                result = db::backfill_api_costs_batch(
+                    &state.pool,
+                    db::API_COST_BACKFILL_BATCH_SIZE,
+                ) => result,
+            };
+            match result {
+                Ok(batch) if batch.selected == 0 => {
+                    if total > 0 {
+                        tracing::info!(requests = total, "historical API cost backfill completed");
+                    }
+                    return;
+                }
+                Ok(batch) => total = total.saturating_add(batch.updated),
+                Err(error) => {
+                    tracing::warn!(%error, "historical API cost backfill batch failed; retrying");
+                    tokio::select! {
+                        _ = shutdown.changed() => return,
+                        _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    }
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+}

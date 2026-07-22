@@ -7,7 +7,7 @@ use codex_lb_rs::{
     cli::{self, Cli, Command, MigrateCommand},
     config::Config,
     crypto::TokenCrypto,
-    db,
+    db, scheduler,
     state::AppState,
 };
 
@@ -39,6 +39,7 @@ async fn migrate() -> Result<()> {
     let config = Config::from_env()?;
     let pool = db::connect(&config.database_url).await?;
     db::run_migrations(&pool).await?;
+    db::backfill_api_costs(&pool).await?;
     db::reset_inflight(&pool).await?;
     println!("migrations applied");
     Ok(())
@@ -59,12 +60,13 @@ async fn serve(config: Config) -> Result<()> {
         );
     }
 
+    let listener = tokio::net::TcpListener::bind(addr).await?;
     let state = AppState::new(config, pool, crypto);
-    let _scheduler = codex_lb_rs::scheduler::spawn(state.clone());
+    let _scheduler = scheduler::spawn(state.clone());
+    let _cost_backfill = scheduler::spawn_api_cost_backfill(state.clone());
     let shutdown_state = state.clone();
     let app = build_app(state);
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "codex-lb-rs listening");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal(shutdown_state))

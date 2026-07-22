@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env,
     path::{Path, PathBuf},
     str::FromStr,
@@ -21,13 +21,21 @@ use crate::{
     error::{AppError, AppResult},
     models::{
         Account, AccountSummary, AccountTokens, LogsQuery, NewRequestLog, RequestLog,
-        RuntimeSettings, SelectedAccount, SessionRoute, SettingRow, UsageSample, UsageSnapshot,
-        UsageSummary, UsageWindow,
+        RuntimeSettings, SelectedAccount, SessionRoute, SettingRow, UsageData, UsageSample,
+        UsageSnapshot, UsageSummary, UsageWindow,
     },
+    pricing::{self, ApiCostStatus, PRICING_VERSION},
     usage::ParsedUsageWindow,
 };
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+pub const API_COST_BACKFILL_BATCH_SIZE: i64 = 500;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ApiCostBackfillBatch {
+    pub selected: u64,
+    pub updated: u64,
+}
 
 pub async fn connect(database_url: &str) -> AppResult<SqlitePool> {
     let database_url = expand_home_in_sqlite_url(database_url)?;
@@ -100,6 +108,193 @@ pub async fn run_migrations(pool: &SqlitePool) -> AppResult<()> {
         .map_err(|err| AppError::Internal(format!("migration failed: {err}")))
 }
 
+#[derive(sqlx::FromRow)]
+struct PendingApiCostRow {
+    id: i64,
+    account_id: Option<Uuid>,
+    model: Option<String>,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    cached_input_tokens: Option<i64>,
+    cache_write_input_tokens: Option<i64>,
+    reasoning_tokens: Option<i64>,
+    effective_model: Option<String>,
+    effective_service_tier: Option<String>,
+}
+
+#[derive(Default)]
+struct ApiCostAggregateDelta {
+    cached_input_tokens: i64,
+    observed_cache_write_input_tokens: i64,
+    lower_nano_usd: i64,
+    upper_nano_usd: i64,
+    complete_requests: i64,
+    partial_requests: i64,
+}
+
+impl ApiCostAggregateDelta {
+    fn add(
+        &mut self,
+        row: &PendingApiCostRow,
+        estimate: pricing::ApiCostEstimate,
+    ) -> AppResult<()> {
+        checked_accumulate(
+            &mut self.cached_input_tokens,
+            row.cached_input_tokens.unwrap_or(0).max(0),
+        )?;
+        checked_accumulate(
+            &mut self.observed_cache_write_input_tokens,
+            row.cache_write_input_tokens.unwrap_or(0).max(0),
+        )?;
+        checked_accumulate(
+            &mut self.lower_nano_usd,
+            estimate.lower_nano_usd.unwrap_or(0),
+        )?;
+        checked_accumulate(
+            &mut self.upper_nano_usd,
+            estimate.upper_nano_usd.unwrap_or(0),
+        )?;
+        checked_accumulate(
+            &mut self.complete_requests,
+            i64::from(estimate.status == ApiCostStatus::Complete),
+        )?;
+        checked_accumulate(
+            &mut self.partial_requests,
+            i64::from(estimate.status == ApiCostStatus::MissingCacheWrite),
+        )
+    }
+}
+
+fn checked_accumulate(total: &mut i64, value: i64) -> AppResult<()> {
+    *total = total
+        .checked_add(value)
+        .ok_or_else(|| AppError::Internal("API cost backfill aggregate overflowed".to_string()))?;
+    Ok(())
+}
+
+/// Fill every pending historical estimate in bounded, restart-safe transactions.
+///
+/// The server uses `backfill_api_costs_batch` from a background task so it can bind
+/// immediately. The explicit migration command uses this helper to finish all work.
+pub async fn backfill_api_costs(pool: &SqlitePool) -> AppResult<u64> {
+    let mut total = 0_u64;
+    loop {
+        let batch = backfill_api_costs_batch(pool, API_COST_BACKFILL_BATCH_SIZE).await?;
+        if batch.selected == 0 {
+            return Ok(total);
+        }
+        total = total
+            .checked_add(batch.updated)
+            .ok_or_else(|| AppError::Internal("API cost backfill count overflowed".to_string()))?;
+        tokio::task::yield_now().await;
+    }
+}
+
+pub async fn backfill_api_costs_batch(
+    pool: &SqlitePool,
+    batch_size: i64,
+) -> AppResult<ApiCostBackfillBatch> {
+    let rows = sqlx::query_as::<_, PendingApiCostRow>(
+        r#"
+        SELECT
+            id, account_id, model, input_tokens, output_tokens, cached_input_tokens,
+            cache_write_input_tokens, reasoning_tokens, effective_model,
+            effective_service_tier
+        FROM request_logs
+        WHERE api_cost_status IS NULL
+        ORDER BY id
+        LIMIT $1
+        "#,
+    )
+    .bind(batch_size.clamp(1, API_COST_BACKFILL_BATCH_SIZE))
+    .fetch_all(pool)
+    .await?;
+    if rows.is_empty() {
+        return Ok(ApiCostBackfillBatch::default());
+    }
+    // Return the selected count rather than the affected count. A concurrent pruner or
+    // second migrator may win every guarded update in this batch; the caller must still
+    // continue until a fresh selection is empty.
+    let selected = rows.len() as u64;
+
+    let mut tx = pool.begin().await?;
+    let mut aggregate_deltas = HashMap::<Uuid, ApiCostAggregateDelta>::new();
+    let mut updated = 0_u64;
+    for row in &rows {
+        let usage = UsageData {
+            input_tokens: row.input_tokens,
+            output_tokens: row.output_tokens,
+            cached_input_tokens: row.cached_input_tokens,
+            cache_write_input_tokens: row.cache_write_input_tokens,
+            reasoning_tokens: row.reasoning_tokens,
+            effective_model: row.effective_model.clone(),
+            effective_service_tier: row.effective_service_tier.clone(),
+        };
+        let model = usage.effective_model.as_deref().or(row.model.as_deref());
+        let estimate = pricing::estimate_standard_api_cost(model, &usage);
+        let result = sqlx::query(
+            r#"
+            UPDATE request_logs
+            SET api_pricing_version = $2,
+                api_cost_status = $3,
+                api_cost_lower_nano_usd = $4,
+                api_cost_upper_nano_usd = $5
+            WHERE id = $1 AND api_cost_status IS NULL
+            "#,
+        )
+        .bind(row.id)
+        .bind(PRICING_VERSION)
+        .bind(estimate.status.as_str())
+        .bind(estimate.lower_nano_usd)
+        .bind(estimate.upper_nano_usd)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() != 1 {
+            continue;
+        }
+        updated += 1;
+        if let Some(account_id) = row.account_id {
+            aggregate_deltas
+                .entry(account_id)
+                .or_default()
+                .add(row, estimate)?;
+        }
+    }
+
+    for (account_id, delta) in aggregate_deltas {
+        sqlx::query(
+            r#"
+            UPDATE account_runtime_state
+            SET cached_input_tokens = cached_input_tokens + $2,
+                observed_cache_write_input_tokens = observed_cache_write_input_tokens + $3,
+                api_cost_lower_nano_usd = api_cost_lower_nano_usd + $4,
+                api_cost_upper_nano_usd = api_cost_upper_nano_usd + $5,
+                api_cost_complete_request_count = api_cost_complete_request_count + $6,
+                api_cost_partial_request_count = api_cost_partial_request_count + $7,
+                api_cost_unpriced_request_count = MAX(
+                    0,
+                    request_count
+                        - (api_cost_complete_request_count + $6)
+                        - (api_cost_partial_request_count + $7)
+                )
+            WHERE account_id = $1
+            "#,
+        )
+        .bind(account_id)
+        .bind(delta.cached_input_tokens)
+        .bind(delta.observed_cache_write_input_tokens)
+        .bind(delta.lower_nano_usd)
+        .bind(delta.upper_nano_usd)
+        .bind(delta.complete_requests)
+        .bind(delta.partial_requests)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    tx.commit().await?;
+    Ok(ApiCostBackfillBatch { selected, updated })
+}
+
 pub async fn upsert_account(
     pool: &SqlitePool,
     crypto: &TokenCrypto,
@@ -170,7 +365,14 @@ pub async fn list_accounts(pool: &SqlitePool) -> AppResult<Vec<AccountSummary>> 
             (SELECT MIN(reset_at) FROM usage_windows WHERE account_id = a.id AND quota_key = 'codex') AS latest_reset_at,
             COALESCE(r.request_count, 0) AS request_count,
             COALESCE(r.input_tokens, 0) AS input_tokens,
+            COALESCE(r.cached_input_tokens, 0) AS cached_input_tokens,
+            COALESCE(r.observed_cache_write_input_tokens, 0) AS observed_cache_write_input_tokens,
             COALESCE(r.output_tokens, 0) AS output_tokens,
+            COALESCE(r.api_cost_lower_nano_usd, 0) AS api_cost_lower_nano_usd,
+            COALESCE(r.api_cost_upper_nano_usd, 0) AS api_cost_upper_nano_usd,
+            COALESCE(r.api_cost_complete_request_count, 0) AS api_cost_complete_request_count,
+            COALESCE(r.api_cost_partial_request_count, 0) AS api_cost_partial_request_count,
+            COALESCE(r.api_cost_unpriced_request_count, 0) AS api_cost_unpriced_request_count,
             r.last_selected_at,
             r.last_request_at,
             r.cooldown_until,
@@ -680,12 +882,25 @@ pub async fn insert_request_log(pool: &SqlitePool, entry: NewRequestLog<'_>) -> 
     let mut tx = pool.begin().await?;
     let input_tokens = entry.usage.input_tokens;
     let output_tokens = entry.usage.output_tokens;
+    let aggregate_cached_input_tokens = entry.usage.cached_input_tokens.map(|value| value.max(0));
+    let aggregate_cache_write_input_tokens = entry
+        .usage
+        .cache_write_input_tokens
+        .map(|value| value.max(0));
+    let cost_model = entry.usage.effective_model.as_deref().or(entry.model);
+    let cost = pricing::estimate_standard_api_cost(cost_model, &entry.usage);
+    let complete_cost = i64::from(cost.status == ApiCostStatus::Complete);
+    let partial_cost = i64::from(cost.status == ApiCostStatus::MissingCacheWrite);
+    let unpriced_cost = i64::from(!cost.status.is_priced());
     sqlx::query(
         r#"
         INSERT INTO request_logs (
             request_id, account_id, model, status, error_code, error_message,
-            input_tokens, output_tokens, cached_input_tokens, reasoning_tokens, latency_ms
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+            input_tokens, output_tokens, cached_input_tokens, cache_write_input_tokens,
+            reasoning_tokens, effective_model, effective_service_tier,
+            api_pricing_version, api_cost_status, api_cost_lower_nano_usd,
+            api_cost_upper_nano_usd, latency_ms
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
         "#,
     )
     .bind(entry.request_id)
@@ -697,7 +912,14 @@ pub async fn insert_request_log(pool: &SqlitePool, entry: NewRequestLog<'_>) -> 
     .bind(input_tokens)
     .bind(output_tokens)
     .bind(entry.usage.cached_input_tokens)
+    .bind(entry.usage.cache_write_input_tokens)
     .bind(entry.usage.reasoning_tokens)
+    .bind(entry.usage.effective_model.as_deref())
+    .bind(entry.usage.effective_service_tier.as_deref())
+    .bind(PRICING_VERSION)
+    .bind(cost.status.as_str())
+    .bind(cost.lower_nano_usd)
+    .bind(cost.upper_nano_usd)
     .bind(entry.latency_ms)
     .execute(&mut *tx)
     .await?;
@@ -710,6 +932,13 @@ pub async fn insert_request_log(pool: &SqlitePool, entry: NewRequestLog<'_>) -> 
                 failed_request_count = failed_request_count + CASE WHEN $2 <> 'success' THEN 1 ELSE 0 END,
                 input_tokens = input_tokens + COALESCE($3, 0),
                 output_tokens = output_tokens + COALESCE($4, 0),
+                cached_input_tokens = cached_input_tokens + COALESCE($5, 0),
+                observed_cache_write_input_tokens = observed_cache_write_input_tokens + COALESCE($6, 0),
+                api_cost_lower_nano_usd = api_cost_lower_nano_usd + COALESCE($7, 0),
+                api_cost_upper_nano_usd = api_cost_upper_nano_usd + COALESCE($8, 0),
+                api_cost_complete_request_count = api_cost_complete_request_count + $9,
+                api_cost_partial_request_count = api_cost_partial_request_count + $10,
+                api_cost_unpriced_request_count = api_cost_unpriced_request_count + $11,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
             WHERE account_id = $1
             "#,
@@ -718,6 +947,13 @@ pub async fn insert_request_log(pool: &SqlitePool, entry: NewRequestLog<'_>) -> 
         .bind(entry.status)
         .bind(input_tokens)
         .bind(output_tokens)
+        .bind(aggregate_cached_input_tokens)
+        .bind(aggregate_cache_write_input_tokens)
+        .bind(cost.lower_nano_usd)
+        .bind(cost.upper_nano_usd)
+        .bind(complete_cost)
+        .bind(partial_cost)
+        .bind(unpriced_cost)
         .execute(&mut *tx)
         .await?;
     }

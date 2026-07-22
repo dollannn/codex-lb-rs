@@ -9,6 +9,7 @@ use crate::{
     db,
     error::AppResult,
     models::{AccountSummary, UsageWindow},
+    pricing::{PRICING_AS_OF, PRICING_BASIS, PRICING_SOURCE},
     state::AppState,
     usage::{PaceMetrics, ParsedUsageWindow, pace_metrics},
 };
@@ -49,8 +50,24 @@ pub struct AccountStatus {
     pub inflight_requests: i64,
     pub request_count: i64,
     pub input_tokens: i64,
+    pub cached_input_tokens: i64,
+    pub observed_cache_write_input_tokens: i64,
     pub output_tokens: i64,
+    pub api_cost_estimate: ApiCostEstimate,
     pub quotas: Vec<WindowStatus>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiCostEstimate {
+    pub lower_usd: f64,
+    pub upper_usd: f64,
+    pub complete_requests: i64,
+    pub partial_requests: i64,
+    pub unpriced_requests: i64,
+    pub basis: &'static str,
+    pub pricing_as_of: &'static str,
+    pub source_url: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -250,7 +267,19 @@ fn to_account_status(
         inflight_requests: account.inflight_count,
         request_count: account.request_count,
         input_tokens: account.input_tokens,
+        cached_input_tokens: account.cached_input_tokens,
+        observed_cache_write_input_tokens: account.observed_cache_write_input_tokens,
         output_tokens: account.output_tokens,
+        api_cost_estimate: ApiCostEstimate {
+            lower_usd: nano_usd_to_usd(account.api_cost_lower_nano_usd),
+            upper_usd: nano_usd_to_usd(account.api_cost_upper_nano_usd),
+            complete_requests: account.api_cost_complete_request_count,
+            partial_requests: account.api_cost_partial_request_count,
+            unpriced_requests: account.api_cost_unpriced_request_count,
+            basis: PRICING_BASIS,
+            pricing_as_of: PRICING_AS_OF,
+            source_url: PRICING_SOURCE,
+        },
         quotas,
     }
 }
@@ -291,10 +320,11 @@ pub fn format_waybar(status: &PoolStatus) -> WaybarStatus {
         .join(" · ");
 
     let mut tooltip = format!(
-        "CODEX POOL  •  {}/{} READY\n{}  •  cached locally",
+        "CODEX POOL  •  {}/{} READY\n{}  •  cached locally\nAPI equivalent  •  standard rates {}  •  not a bill",
         status.available_account_count,
         status.account_count,
-        status.routing_strategy.replace('_', " ")
+        status.routing_strategy.replace('_', " "),
+        PRICING_AS_OF,
     );
     for account in &status.accounts {
         let selected = if account.selected { "●" } else { "○" };
@@ -335,10 +365,11 @@ pub fn format_waybar(status: &PoolStatus) -> WaybarStatus {
             tooltip.push_str(&format!("\n│ Usage: {}", one_line(error, 88)));
         }
         tooltip.push_str(&format!(
-            "\n└ Activity  {} requests  •  {} input / {} output tokens",
+            "\n├ Activity  {} requests  •  {} input / {} output tokens\n└ API equivalent  {}",
             compact_count(account.request_count),
             compact_count(account.input_tokens),
             compact_count(account.output_tokens),
+            format_api_cost(account),
         ));
     }
 
@@ -527,6 +558,63 @@ fn compact_count(value: i64) -> String {
     format!("{sign}{number}{}", UNITS[unit])
 }
 
+fn nano_usd_to_usd(value: i64) -> f64 {
+    value.max(0) as f64 / 1_000_000_000.0
+}
+
+fn format_api_cost(account: &AccountStatus) -> String {
+    let estimate = &account.api_cost_estimate;
+    let covered = estimate.complete_requests + estimate.partial_requests;
+    if covered <= 0 {
+        return "—  •  no priced usage".to_string();
+    }
+
+    let amount = format_usd_estimate(estimate.lower_usd, estimate.upper_usd);
+    let cost_population = covered + estimate.unpriced_requests;
+    if cost_population <= 0 {
+        return amount;
+    }
+    let coverage = (covered as f64 / cost_population as f64 * 100.0).clamp(0.0, 100.0);
+    format!("{amount}  •  {coverage:.0}% requests priced")
+}
+
+fn format_usd_estimate(lower: f64, upper: f64) -> String {
+    let lower = lower.max(0.0);
+    let upper = upper.max(0.0);
+    let compact_lower = format_usd(lower);
+    let compact_upper = format_usd(upper);
+    if lower == upper {
+        return format!("≈{compact_lower}");
+    }
+    if compact_lower != compact_upper {
+        return format!("≈{compact_lower}–{compact_upper}");
+    }
+
+    for decimals in 2..=9 {
+        let precise_lower = format!("${lower:.decimals$}");
+        let precise_upper = format!("${upper:.decimals$}");
+        if precise_lower != precise_upper {
+            return format!("≈{precise_lower}–{precise_upper}");
+        }
+    }
+    format!("≈{compact_lower}")
+}
+
+fn format_usd(value: f64) -> String {
+    let value = value.max(0.0);
+    if value >= 1_000_000.0 {
+        format!("${:.1}M", value / 1_000_000.0)
+    } else if value >= 1_000.0 {
+        format!("${:.1}k", value / 1_000.0)
+    } else if value >= 100.0 {
+        format!("${value:.0}")
+    } else if value >= 10.0 {
+        format!("${value:.1}")
+    } else {
+        format!("${value:.2}")
+    }
+}
+
 fn one_line(value: &str, limit: usize) -> String {
     let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
     if value.chars().count() <= limit {
@@ -544,8 +632,9 @@ mod tests {
     use crate::{models::AccountSummary, usage::PaceMetrics};
 
     use super::{
-        AccountStatus, PoolStatus, WindowStatus, compact_count, exhaustion_forecast, format_waybar,
-        human_duration, reset_eta, to_account_status,
+        AccountStatus, ApiCostEstimate, PoolStatus, WindowStatus, compact_count,
+        exhaustion_forecast, format_usd_estimate, format_waybar, human_duration, reset_eta,
+        to_account_status,
     };
 
     #[test]
@@ -600,7 +689,19 @@ mod tests {
                 // Intentionally synthetic values; do not copy live account telemetry here.
                 request_count: 12_345,
                 input_tokens: 1_234_567_890,
+                cached_input_tokens: 1_000_000_000,
+                observed_cache_write_input_tokens: 0,
                 output_tokens: 5_678_901,
+                api_cost_estimate: ApiCostEstimate {
+                    lower_usd: 1_234.0,
+                    upper_usd: 1_567.0,
+                    complete_requests: 0,
+                    partial_requests: 10_000,
+                    unpriced_requests: 2_345,
+                    basis: "test basis",
+                    pricing_as_of: "2026-07-22",
+                    source_url: "https://example.com/pricing",
+                },
                 quotas: vec![
                     quota("codex", "Codex", 42.0, "safe", Some(0.5)),
                     quota(
@@ -621,6 +722,11 @@ mod tests {
             output
                 .tooltip
                 .contains("Activity  12.3k requests  •  1.2B input / 5.7M output tokens")
+        );
+        assert!(
+            output
+                .tooltip
+                .contains("API equivalent  ≈$1.2k–$1.6k  •  81% requests priced")
         );
         assert_eq!(output.percentage, 42);
         assert!(!output.class.iter().any(|class| class == "pace-hot"));
@@ -644,6 +750,13 @@ mod tests {
         for (value, expected) in cases {
             assert_eq!(compact_count(value), expected, "value={value}");
         }
+    }
+
+    #[test]
+    fn cost_ranges_preserve_distinct_bounds_after_compact_rounding() {
+        assert_eq!(format_usd_estimate(0.004, 0.008), "≈$0.00–$0.01");
+        assert_eq!(format_usd_estimate(100.10, 100.40), "≈$100.10–$100.40");
+        assert_eq!(format_usd_estimate(1_234.0, 1_234.0), "≈$1.2k");
     }
 
     #[test]
@@ -751,7 +864,14 @@ mod tests {
             latest_reset_at: None,
             request_count: 0,
             input_tokens: 0,
+            cached_input_tokens: 0,
+            observed_cache_write_input_tokens: 0,
             output_tokens: 0,
+            api_cost_lower_nano_usd: 0,
+            api_cost_upper_nano_usd: 0,
+            api_cost_complete_request_count: 0,
+            api_cost_partial_request_count: 0,
+            api_cost_unpriced_request_count: 0,
             last_selected_at: None,
             last_request_at: None,
             cooldown_until: None,

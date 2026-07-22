@@ -6,6 +6,7 @@ pub mod crypto;
 pub mod db;
 pub mod error;
 pub mod models;
+pub mod pricing;
 pub mod proxy;
 pub mod scheduler;
 pub mod state;
