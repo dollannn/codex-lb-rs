@@ -49,6 +49,7 @@ pub struct AccountSummary {
     pub last_selected_at: Option<DateTime<Utc>>,
     pub last_request_at: Option<DateTime<Utc>>,
     pub cooldown_until: Option<DateTime<Utc>>,
+    pub cooldown_reason: Option<String>,
     pub inflight_count: i64,
 }
 

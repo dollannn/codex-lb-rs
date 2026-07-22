@@ -173,6 +173,7 @@ pub async fn list_accounts(pool: &SqlitePool) -> AppResult<Vec<AccountSummary>> 
             r.last_selected_at,
             r.last_request_at,
             r.cooldown_until,
+            r.cooldown_reason,
             COALESCE(r.inflight_count, 0) AS inflight_count
         FROM accounts a
         LEFT JOIN account_runtime_state r ON r.account_id = a.id
@@ -328,6 +329,7 @@ pub async fn select_account_for_request(
     query.push(
         r#",
             cooldown_until = NULL,
+            cooldown_reason = NULL,
             inflight_count = inflight_count + 1,
             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
         WHERE account_id = (
@@ -424,6 +426,8 @@ async fn mark_selected(pool: &SqlitePool, account_id: Uuid) -> AppResult<()> {
         r#"
         UPDATE account_runtime_state
         SET last_selected_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            cooldown_until = NULL,
+            cooldown_reason = NULL,
             inflight_count = inflight_count + 1,
             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
         WHERE account_id = $1
@@ -446,6 +450,11 @@ pub async fn acquire_account_if_available(pool: &SqlitePool, account_id: Uuid) -
                 WHEN cooldown_until IS NOT NULL
                  AND julianday(cooldown_until) <= julianday('now') THEN NULL
                 ELSE cooldown_until
+            END,
+            cooldown_reason = CASE
+                WHEN cooldown_until IS NOT NULL
+                 AND julianday(cooldown_until) <= julianday('now') THEN NULL
+                ELSE cooldown_reason
             END,
             inflight_count = inflight_count + 1,
             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
@@ -568,6 +577,7 @@ pub async fn cooldown_account(
         r#"
         UPDATE account_runtime_state
         SET cooldown_until = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', printf('+%d seconds', $2)),
+            cooldown_reason = $3,
             failure_count = failure_count + 1,
             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
         WHERE account_id = $1
@@ -575,12 +585,6 @@ pub async fn cooldown_account(
     )
     .bind(id)
     .bind(seconds)
-    .execute(pool)
-    .await?;
-    sqlx::query(
-        "UPDATE accounts SET status_reason = $2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = $1",
-    )
-    .bind(id)
     .bind(reason)
     .execute(pool)
     .await?;

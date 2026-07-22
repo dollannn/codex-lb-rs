@@ -142,7 +142,7 @@ codex exec "Reply with OK only."
 }
 ```
 
-The bar stays compact: each account is reduced to its initial, selected marker, quota percentage, and pace/state symbol (for example `●W:11%↑ · P:!`). Hovering opens a grouped mini-dashboard with full aliases, readiness, quota bars, remaining capacity, reset time, pace, and locally recorded activity. CSS classes include `codex-pool` plus health/pace classes from the returned payload.
+The bar stays compact: each account is reduced to its initial, selected marker, core Codex quota percentage, and pace/state symbol (for example `●W:11%↑ · P:!`). Hovering opens a grouped mini-dashboard with full aliases, readiness, the core Codex quota bar, remaining capacity, reset time, pace, and locally recorded activity. Additional feature meters are retained in the status API but omitted from Waybar. CSS classes include `codex-pool` plus health/pace classes from the returned payload.
 
 For another local status client, use:
 

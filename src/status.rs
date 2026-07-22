@@ -219,6 +219,16 @@ fn to_account_status(
             .cooldown_until
             .is_none_or(|cooldown_until| cooldown_until <= now)
         && !exhausted;
+    let status_reason = if account.status != "active" {
+        account.status_reason.clone()
+    } else if account
+        .cooldown_until
+        .is_some_and(|cooldown_until| cooldown_until > now)
+    {
+        account.cooldown_reason.clone()
+    } else {
+        None
+    };
     AccountStatus {
         id: account.id,
         label: if account.label.is_empty() {
@@ -230,7 +240,7 @@ fn to_account_status(
         status: account.status.clone(),
         available,
         selected,
-        status_reason: account.status_reason.clone(),
+        status_reason,
         auth_expires_at: account.access_token_expires_at,
         last_usage_refresh_at: account.last_usage_refresh_at,
         last_usage_error: account.last_usage_error.clone(),
@@ -302,7 +312,11 @@ pub fn format_waybar(status: &PoolStatus) -> WaybarStatus {
         if account.quotas.is_empty() {
             tooltip.push_str("\n│ No fresh quota data");
         }
-        for window in &account.quotas {
+        for window in account
+            .quotas
+            .iter()
+            .filter(|window| window.quota_key == "codex")
+        {
             let pace = window.pace.pace_ratio.map_or_else(
                 || "pace —".to_string(),
                 |ratio| {
@@ -468,9 +482,12 @@ fn one_line(value: &str, limit: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
+    use chrono::{Duration, Utc};
+    use uuid::Uuid;
 
-    use super::{PoolStatus, format_waybar};
+    use crate::{models::AccountSummary, usage::PaceMetrics};
+
+    use super::{AccountStatus, PoolStatus, WindowStatus, format_waybar, to_account_status};
 
     #[test]
     fn empty_pool_has_actionable_waybar_state() {
@@ -490,5 +507,139 @@ mod tests {
         });
         assert_eq!(output.alt, "empty");
         assert!(output.text.contains("no accounts"));
+    }
+
+    #[test]
+    fn waybar_only_renders_core_codex_quota() {
+        let now = Utc::now();
+        let output = format_waybar(&PoolStatus {
+            service: "codex-lb-rs",
+            version: "test",
+            healthy: true,
+            degraded: false,
+            routing_strategy: "usage_weighted".to_string(),
+            account_count: 1,
+            active_account_count: 1,
+            available_account_count: 1,
+            inflight_requests: 0,
+            selected_account: Some("account-a".to_string()),
+            accounts: vec![AccountStatus {
+                id: Uuid::nil(),
+                label: "account-a".to_string(),
+                plan: "pro".to_string(),
+                status: "active".to_string(),
+                available: true,
+                selected: true,
+                status_reason: None,
+                auth_expires_at: None,
+                last_usage_refresh_at: Some(now),
+                last_usage_error: None,
+                last_selected_at: Some(now),
+                last_request_at: Some(now),
+                cooldown_until: None,
+                inflight_requests: 0,
+                request_count: 1,
+                input_tokens: 2,
+                output_tokens: 3,
+                quotas: vec![
+                    quota("codex", "Codex", 42.0, "safe", Some(0.5)),
+                    quota(
+                        "codex_bengalfox",
+                        "GPT-5.3-Codex-Spark",
+                        99.0,
+                        "danger",
+                        Some(10.0),
+                    ),
+                ],
+            }],
+            generated_at: now,
+        });
+
+        assert!(output.tooltip.contains("Codex  •  7d"));
+        assert!(!output.tooltip.contains("GPT-5.3-Codex-Spark"));
+        assert_eq!(output.percentage, 42);
+        assert!(!output.class.iter().any(|class| class == "pace-hot"));
+        assert!(!output.class.iter().any(|class| class == "pool-low"));
+    }
+
+    #[test]
+    fn temporary_reason_is_visible_only_during_cooldown() {
+        let now = Utc::now();
+        let mut account = account_summary(now);
+        account.status_reason = Some("legacy stale reason".to_string());
+        account.cooldown_reason = Some("transient upstream error".to_string());
+        account.cooldown_until = Some(now + Duration::seconds(10));
+
+        let cooling = to_account_status(&account, 0, vec![], now, false);
+        assert_eq!(
+            cooling.status_reason.as_deref(),
+            Some("transient upstream error")
+        );
+
+        account.cooldown_until = Some(now - Duration::seconds(1));
+        let recovered = to_account_status(&account, 0, vec![], now, false);
+        assert_eq!(recovered.status_reason, None);
+
+        account.status = "auth_failed".to_string();
+        account.status_reason = Some("device login required".to_string());
+        let persistent = to_account_status(&account, 0, vec![], now, false);
+        assert_eq!(
+            persistent.status_reason.as_deref(),
+            Some("device login required")
+        );
+    }
+
+    fn quota(
+        quota_key: &str,
+        quota_name: &str,
+        used_percent: f64,
+        risk: &'static str,
+        pace_ratio: Option<f64>,
+    ) -> WindowStatus {
+        WindowStatus {
+            quota_key: quota_key.to_string(),
+            quota_name: quota_name.to_string(),
+            window: "7d".to_string(),
+            used_percent,
+            remaining_percent: 100.0 - used_percent,
+            window_seconds: Some(604_800),
+            reset_at: None,
+            fetched_at: Utc::now(),
+            pace: PaceMetrics {
+                observed_percent_per_hour: None,
+                sustainable_percent_per_hour: None,
+                pace_ratio,
+                headroom_percent: None,
+                projected_exhaustion_at: None,
+                risk,
+            },
+        }
+    }
+
+    fn account_summary(now: chrono::DateTime<Utc>) -> AccountSummary {
+        AccountSummary {
+            id: Uuid::nil(),
+            chatgpt_account_id: None,
+            label: "account-a".to_string(),
+            email: "account-a@example.com".to_string(),
+            plan_type: "pro".to_string(),
+            status: "active".to_string(),
+            status_reason: None,
+            last_refresh_at: now,
+            access_token_expires_at: None,
+            last_usage_refresh_at: Some(now),
+            last_usage_error: None,
+            created_at: now,
+            latest_used_percent: None,
+            latest_reset_at: None,
+            request_count: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            last_selected_at: None,
+            last_request_at: None,
+            cooldown_until: None,
+            cooldown_reason: None,
+            inflight_count: 0,
+        }
     }
 }

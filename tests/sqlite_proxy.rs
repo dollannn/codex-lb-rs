@@ -119,6 +119,33 @@ async fn sqlite_admin_and_proxy_failover_smoke() -> Result<()> {
     assert_eq!(second_selection.account.id, good_account);
     db::release_account(&pool, second_selection.account.id).await?;
 
+    db::cooldown_account(&pool, good_account, 10, "transient upstream error").await?;
+    let cooling = db::list_accounts(&pool)
+        .await?
+        .into_iter()
+        .find(|account| account.id == good_account)
+        .expect("cooling account");
+    assert_eq!(cooling.status_reason, None);
+    assert_eq!(
+        cooling.cooldown_reason.as_deref(),
+        Some("transient upstream error")
+    );
+    sqlx::query(
+        "UPDATE account_runtime_state SET cooldown_until = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 second') WHERE account_id = $1",
+    )
+    .bind(good_account)
+    .execute(&pool)
+    .await?;
+    assert!(db::acquire_account_if_available(&pool, good_account).await?);
+    db::release_account(&pool, good_account).await?;
+    let recovered = db::list_accounts(&pool)
+        .await?
+        .into_iter()
+        .find(|account| account.id == good_account)
+        .expect("recovered account");
+    assert_eq!(recovered.cooldown_until, None);
+    assert_eq!(recovered.cooldown_reason, None);
+
     let app = build_app(AppState::new(config, pool.clone(), crypto.clone()));
     let app_server = TestServer::start(app).await?;
     let client = reqwest::Client::new();
