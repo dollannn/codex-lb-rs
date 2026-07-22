@@ -149,12 +149,12 @@ pub fn pace_metrics(
     current: &ParsedUsageWindow,
     fetched_at: DateTime<Utc>,
     previous: Option<(f64, DateTime<Utc>, Option<DateTime<Utc>>)>,
-    now: DateTime<Utc>,
+    _now: DateTime<Utc>,
 ) -> PaceMetrics {
     let remaining = (100.0 - current.used_percent).max(0.0);
     let remaining_hours = current
         .reset_at
-        .map(|reset| (reset - now).num_seconds().max(0) as f64 / 3_600.0)
+        .map(|reset| (reset - fetched_at).num_seconds().max(0) as f64 / 3_600.0)
         .filter(|hours| *hours > 0.0);
     let sustainable = remaining_hours.map(|hours| remaining / hours);
 
@@ -168,16 +168,14 @@ pub fn pace_metrics(
             .filter(|rate| rate.is_finite() && *rate >= 0.0)
     });
 
-    let fallback_ratio = elapsed_window_ratio(current, now);
+    let fallback_ratio = elapsed_window_ratio(current, fetched_at);
     let ratio = match (observed, sustainable) {
         (Some(rate), Some(safe)) if safe > 0.0 => Some(rate / safe),
         _ => fallback_ratio,
     };
-    let projected_exhaustion_at = observed
-        .filter(|rate| *rate > 0.0 && remaining > 0.0)
-        .map(|rate| now + Duration::milliseconds((remaining / rate * 3_600_000.0) as i64));
+    let projected_exhaustion_at = projected_exhaustion_at(fetched_at, remaining, observed);
     let headroom =
-        elapsed_window_percent(current, now).map(|elapsed| elapsed - current.used_percent);
+        elapsed_window_percent(current, fetched_at).map(|elapsed| elapsed - current.used_percent);
     let risk = if current.used_percent >= 100.0 {
         "critical"
     } else if current.used_percent >= 90.0 {
@@ -201,6 +199,24 @@ pub fn pace_metrics(
         projected_exhaustion_at,
         risk,
     }
+}
+
+fn projected_exhaustion_at(
+    fetched_at: DateTime<Utc>,
+    remaining_percent: f64,
+    observed_percent_per_hour: Option<f64>,
+) -> Option<DateTime<Utc>> {
+    let rate = observed_percent_per_hour.filter(|rate| rate.is_finite() && *rate > 0.0)?;
+    if !remaining_percent.is_finite() || remaining_percent <= 0.0 {
+        return None;
+    }
+
+    let milliseconds = (remaining_percent / rate * 3_600_000.0).round();
+    if !milliseconds.is_finite() || milliseconds <= 0.0 || milliseconds > i64::MAX as f64 {
+        return None;
+    }
+    let duration = Duration::try_milliseconds(milliseconds as i64)?;
+    fetched_at.checked_add_signed(duration)
 }
 
 fn same_reset_window(left: Option<DateTime<Utc>>, right: Option<DateTime<Utc>>) -> bool {
@@ -273,7 +289,8 @@ mod tests {
 
     #[test]
     fn computes_observed_and_sustainable_pace() {
-        let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let fetched_at = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let generated_at = fetched_at + Duration::hours(2);
         let mut window = parse_usage_windows(
             &json!({
                 "rate_limit": {"primary_window": {
@@ -282,21 +299,104 @@ mod tests {
                     "reset_after_seconds": 360000
                 }}
             }),
-            now,
+            fetched_at,
         )
         .remove(0);
-        window.reset_at = Some(now + Duration::hours(100));
+        window.reset_at = Some(fetched_at + Duration::hours(100));
 
         let pace = pace_metrics(
             &window,
-            now,
-            Some((40.0, now - Duration::hours(10), window.reset_at)),
-            now,
+            fetched_at,
+            Some((40.0, fetched_at - Duration::hours(10), window.reset_at)),
+            generated_at,
         );
 
         assert_eq!(pace.observed_percent_per_hour, Some(1.0));
         assert_eq!(pace.sustainable_percent_per_hour, Some(0.5));
         assert_eq!(pace.pace_ratio, Some(2.0));
+        assert_eq!(
+            pace.projected_exhaustion_at,
+            Some(fetched_at + Duration::hours(50))
+        );
+        assert_close(pace.headroom_percent.unwrap(), -9.523_809_523_809_526);
         assert_eq!(pace.risk, "danger");
+    }
+
+    #[test]
+    fn fallback_pace_is_anchored_to_fetched_at() {
+        let fetched_at = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let mut window = parse_usage_windows(
+            &json!({
+                "rate_limit": {"primary_window": {
+                    "used_percent": 50,
+                    "limit_window_seconds": 604800,
+                    "reset_after_seconds": 360000
+                }}
+            }),
+            fetched_at,
+        )
+        .remove(0);
+        window.reset_at = Some(fetched_at + Duration::hours(100));
+
+        let pace = pace_metrics(&window, fetched_at, None, fetched_at + Duration::hours(12));
+
+        assert_close(pace.pace_ratio.unwrap(), 1.235_294_117_647_058_9);
+        assert_close(pace.headroom_percent.unwrap(), -9.523_809_523_809_526);
+    }
+
+    #[test]
+    fn exhaustion_projection_rejects_unusable_rates_and_overflow() {
+        let fetched_at = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let mut window = parse_usage_windows(
+            &json!({
+                "rate_limit": {"primary_window": {
+                    "used_percent": 50,
+                    "limit_window_seconds": 604800,
+                    "reset_after_seconds": 360000
+                }}
+            }),
+            fetched_at,
+        )
+        .remove(0);
+        window.reset_at = Some(fetched_at + Duration::hours(100));
+
+        let zero_rate = pace_metrics(
+            &window,
+            fetched_at,
+            Some((50.0, fetched_at - Duration::hours(1), window.reset_at)),
+            fetched_at,
+        );
+        assert_eq!(zero_rate.observed_percent_per_hour, Some(0.0));
+        assert_eq!(zero_rate.projected_exhaustion_at, None);
+
+        let corrected_usage = pace_metrics(
+            &window,
+            fetched_at,
+            Some((51.0, fetched_at - Duration::hours(1), window.reset_at)),
+            fetched_at,
+        );
+        assert_eq!(corrected_usage.observed_percent_per_hour, None);
+        assert_eq!(corrected_usage.projected_exhaustion_at, None);
+
+        let tiny_rate = pace_metrics(
+            &window,
+            fetched_at,
+            Some((
+                50.0 - 1e-12,
+                fetched_at - Duration::hours(1),
+                window.reset_at,
+            )),
+            fetched_at,
+        );
+        assert!(
+            tiny_rate
+                .observed_percent_per_hour
+                .is_some_and(|rate| rate > 0.0)
+        );
+        assert_eq!(tiny_rate.projected_exhaustion_at, None);
+    }
+
+    fn assert_close(left: f64, right: f64) {
+        assert!((left - right).abs() < 1e-12, "{left} != {right}");
     }
 }

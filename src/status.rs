@@ -317,24 +317,16 @@ pub fn format_waybar(status: &PoolStatus) -> WaybarStatus {
             .iter()
             .filter(|window| window.quota_key == "codex")
         {
-            let pace = window.pace.pace_ratio.map_or_else(
-                || "pace —".to_string(),
-                |ratio| {
-                    format!(
-                        "pace {ratio:.1}× {} {}",
-                        pace_arrow(window),
-                        window.pace.risk.to_ascii_uppercase()
-                    )
-                },
-            );
             tooltip.push_str(&format!(
-                "\n├ {}  •  {}\n│ {}  {:>3.0}% used  •  {:>3.0}% free\n│ {pace}  •  reset {}",
+                "\n├ {}  •  {}\n│ {}  {:>3.0}% used  •  {:>3.0}% free\n│ at pace  {}  •  {}\n│ reset {}",
                 window.quota_name,
                 window.window,
                 usage_bar(window.used_percent),
                 window.used_percent,
                 window.remaining_percent,
-                eta(window.reset_at, status.generated_at),
+                exhaustion_forecast(window, status.generated_at),
+                window.pace.risk.to_ascii_uppercase(),
+                reset_eta(window.reset_at, status.generated_at),
             ));
         }
         if account.status != "auth_failed"
@@ -343,8 +335,10 @@ pub fn format_waybar(status: &PoolStatus) -> WaybarStatus {
             tooltip.push_str(&format!("\n│ Usage: {}", one_line(error, 88)));
         }
         tooltip.push_str(&format!(
-            "\n└ Activity  {} requests  •  {} in / {} out",
-            account.request_count, account.input_tokens, account.output_tokens
+            "\n└ Activity  {} requests  •  {} input / {} output tokens",
+            compact_count(account.request_count),
+            compact_count(account.input_tokens),
+            compact_count(account.output_tokens),
         ));
     }
 
@@ -455,10 +449,43 @@ fn account_display_state(account: &AccountStatus, now: DateTime<Utc>) -> &'stati
     }
 }
 
-fn eta(reset_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
-    let Some(seconds) = reset_at.map(|reset| (reset - now).num_seconds().max(0)) else {
+fn exhaustion_forecast(window: &WindowStatus, now: DateTime<Utc>) -> String {
+    if window.reset_at.is_some_and(|reset_at| reset_at <= now) {
+        return "ETA stale".to_string();
+    }
+    if window.used_percent >= 100.0 {
+        return "empty now".to_string();
+    }
+    let Some(projected) = window.pace.projected_exhaustion_at else {
+        return "empty ETA —".to_string();
+    };
+    if window
+        .reset_at
+        .is_some_and(|reset_at| projected >= reset_at)
+    {
+        return "survives to reset".to_string();
+    }
+    let seconds = (projected - now).num_seconds();
+    if seconds <= 0 {
+        return "empty ETA due".to_string();
+    }
+    format!("empty in ~{}", human_duration(seconds))
+}
+
+fn reset_eta(reset_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
+    let Some(seconds) = reset_at.map(|reset| (reset - now).num_seconds()) else {
         return "unknown".to_string();
     };
+    if seconds <= 0 {
+        return "due; refresh pending".to_string();
+    }
+    format!("in {}", human_duration(seconds))
+}
+
+fn human_duration(seconds: i64) -> String {
+    if seconds < 60 {
+        return "<1m".to_string();
+    }
     let days = seconds / 86_400;
     let hours = (seconds % 86_400) / 3_600;
     let minutes = (seconds % 3_600) / 60;
@@ -469,6 +496,35 @@ fn eta(reset_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
     } else {
         format!("{minutes}m")
     }
+}
+
+fn compact_count(value: i64) -> String {
+    const UNITS: [&str; 7] = ["", "k", "M", "B", "T", "P", "E"];
+    let sign = if value < 0 { "-" } else { "" };
+    let magnitude = value.unsigned_abs() as f64;
+    let mut unit = 0;
+    let mut scaled = magnitude;
+    while scaled >= 1_000.0 && unit < UNITS.len() - 1 {
+        scaled /= 1_000.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        return value.to_string();
+    }
+
+    let precision = usize::from(scaled < 100.0);
+    let factor = if precision == 0 { 1.0 } else { 10.0 };
+    let mut rounded = (scaled * factor).round() / factor;
+    if rounded >= 1_000.0 && unit < UNITS.len() - 1 {
+        rounded /= 1_000.0;
+        unit += 1;
+    }
+    let number = if rounded.fract() == 0.0 {
+        format!("{rounded:.0}")
+    } else {
+        format!("{rounded:.1}")
+    };
+    format!("{sign}{number}{}", UNITS[unit])
 }
 
 fn one_line(value: &str, limit: usize) -> String {
@@ -487,7 +543,10 @@ mod tests {
 
     use crate::{models::AccountSummary, usage::PaceMetrics};
 
-    use super::{AccountStatus, PoolStatus, WindowStatus, format_waybar, to_account_status};
+    use super::{
+        AccountStatus, PoolStatus, WindowStatus, compact_count, exhaustion_forecast, format_waybar,
+        human_duration, reset_eta, to_account_status,
+    };
 
     #[test]
     fn empty_pool_has_actionable_waybar_state() {
@@ -538,9 +597,10 @@ mod tests {
                 last_request_at: Some(now),
                 cooldown_until: None,
                 inflight_requests: 0,
-                request_count: 1,
-                input_tokens: 2,
-                output_tokens: 3,
+                // Intentionally synthetic values; do not copy live account telemetry here.
+                request_count: 12_345,
+                input_tokens: 1_234_567_890,
+                output_tokens: 5_678_901,
                 quotas: vec![
                     quota("codex", "Codex", 42.0, "safe", Some(0.5)),
                     quota(
@@ -557,9 +617,66 @@ mod tests {
 
         assert!(output.tooltip.contains("Codex  •  7d"));
         assert!(!output.tooltip.contains("GPT-5.3-Codex-Spark"));
+        assert!(
+            output
+                .tooltip
+                .contains("Activity  12.3k requests  •  1.2B input / 5.7M output tokens")
+        );
         assert_eq!(output.percentage, 42);
         assert!(!output.class.iter().any(|class| class == "pace-hot"));
         assert!(!output.class.iter().any(|class| class == "pool-low"));
+    }
+
+    #[test]
+    fn compact_counts_use_decimal_units_and_promote_after_rounding() {
+        let cases = [
+            (0, "0"),
+            (999, "999"),
+            (1_000, "1k"),
+            (1_250, "1.3k"),
+            (12_345, "12.3k"),
+            (999_499, "999k"),
+            (999_500, "1M"),
+            (5_678_901, "5.7M"),
+            (1_234_567_890, "1.2B"),
+            (i64::MAX, "9.2E"),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(compact_count(value), expected, "value={value}");
+        }
+    }
+
+    #[test]
+    fn exhaustion_forecast_explains_survival_instead_of_pace_ratio() {
+        let now = Utc::now();
+        let mut window = quota("codex", "Codex", 50.0, "danger", Some(113.0));
+        window.reset_at = Some(now + Duration::days(2));
+        window.pace.projected_exhaustion_at = Some(now + Duration::hours(15));
+        assert_eq!(exhaustion_forecast(&window, now), "empty in ~15h 0m");
+
+        window.pace.projected_exhaustion_at = window.reset_at;
+        assert_eq!(exhaustion_forecast(&window, now), "survives to reset");
+
+        window.pace.projected_exhaustion_at = Some(now - Duration::minutes(1));
+        assert_eq!(exhaustion_forecast(&window, now), "empty ETA due");
+
+        window.used_percent = 100.0;
+        assert_eq!(exhaustion_forecast(&window, now), "empty now");
+
+        window.reset_at = Some(now);
+        assert_eq!(exhaustion_forecast(&window, now), "ETA stale");
+    }
+
+    #[test]
+    fn relative_times_are_clear_at_boundaries() {
+        let now = Utc::now();
+        assert_eq!(human_duration(59), "<1m");
+        assert_eq!(human_duration(60), "1m");
+        assert_eq!(human_duration(3_600), "1h 0m");
+        assert_eq!(human_duration(90_000), "1d 1h");
+        assert_eq!(reset_eta(None, now), "unknown");
+        assert_eq!(reset_eta(Some(now), now), "due; refresh pending");
+        assert_eq!(reset_eta(Some(now + Duration::minutes(5)), now), "in 5m");
     }
 
     #[test]
