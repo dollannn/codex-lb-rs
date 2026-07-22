@@ -30,6 +30,11 @@ use crate::{
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 pub const API_COST_BACKFILL_BATCH_SIZE: i64 = 500;
+const MIN_ROUTING_USAGE_FRESHNESS_SECONDS: u64 = 300;
+const ROUTING_USAGE_FRESHNESS_INTERVALS: u64 = 3;
+const ROUTING_CLOCK_SKEW_SECONDS: f64 = 300.0;
+const ROUTING_UNKNOWN_PRESSURE: f64 = 100.0;
+const ROUTING_INFLIGHT_PENALTY: f64 = 2.0;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ApiCostBackfillBatch {
@@ -484,7 +489,9 @@ pub async fn select_account_for_request(
     affinity: Option<(&str, &str)>,
     excluded: &HashSet<Uuid>,
     settings: &RuntimeSettings,
+    usage_refresh_interval: Duration,
 ) -> AppResult<SelectedAccount> {
+    let selected_at = Utc::now().format("%Y-%m-%dT%H:%M:%S%.9fZ").to_string();
     if let Some((key_hash, _)) = affinity {
         let pinned = sqlx::query_scalar::<_, Uuid>(
             r#"
@@ -494,41 +501,158 @@ pub async fn select_account_for_request(
             INNER JOIN account_runtime_state r ON r.account_id = a.id
             WHERE af.key_hash = $1
               AND a.status = 'active'
-              AND julianday(af.last_used_at) >= julianday('now', printf('-%d seconds', $2))
-              AND (r.cooldown_until IS NULL OR julianday(r.cooldown_until) <= julianday('now'))
+              AND julianday(af.last_used_at) >= julianday($3, printf('-%d seconds', $2))
+              AND (r.cooldown_until IS NULL OR julianday(r.cooldown_until) <= julianday($3))
               AND NOT EXISTS (
                   SELECT 1 FROM usage_windows exhausted
                   WHERE exhausted.account_id = a.id
                     AND exhausted.quota_key = 'codex'
                     AND exhausted.used_percent >= 100
-                    AND (exhausted.reset_at IS NULL OR julianday(exhausted.reset_at) > julianday('now'))
+                    AND (
+                        exhausted.reset_at IS NULL
+                        OR julianday(exhausted.reset_at) IS NULL
+                        OR julianday(exhausted.reset_at) > julianday($3)
+                    )
               )
             "#,
         )
         .bind(key_hash)
         .bind(settings.sticky_session_ttl_seconds)
+        .bind(&selected_at)
         .fetch_optional(pool)
         .await?;
         if let Some(account_id) = pinned.filter(|id| !excluded.contains(id)) {
-            mark_selected(pool, account_id).await?;
-            return match selected_account(pool, crypto, account_id).await {
-                Ok(selected) => Ok(selected),
-                Err(error) => {
-                    release_account(pool, account_id).await.ok();
-                    Err(error)
-                }
-            };
+            // Re-check and acquire in one UPDATE so a cooldown or pause applied
+            // after the affinity lookup cannot be cleared by the sticky path.
+            if acquire_account_if_available(pool, account_id).await? {
+                return match selected_account(pool, crypto, account_id).await {
+                    Ok(selected) => Ok(selected),
+                    Err(error) => {
+                        release_account(pool, account_id).await.ok();
+                        Err(error)
+                    }
+                };
+            }
         }
     }
 
     let mut tx = pool.begin().await?;
-    let selected_at = Utc::now().format("%Y-%m-%dT%H:%M:%S%.9fZ").to_string();
+    let freshness_seconds = usage_refresh_interval
+        .as_secs()
+        .saturating_mul(ROUTING_USAGE_FRESHNESS_INTERVALS)
+        .max(MIN_ROUTING_USAGE_FRESHNESS_SECONDS)
+        .min(i64::MAX as u64) as i64;
+    let usage_weighted = settings.routing_strategy != "round_robin";
     let mut query = QueryBuilder::<Sqlite>::new(
+        "WITH clock(now_jd, freshness_days, skew_days) AS (SELECT julianday(",
+    );
+    query.push_bind(&selected_at);
+    query.push(") , CAST(");
+    query.push_bind(freshness_seconds);
+    query.push(" AS REAL) / 86400.0, ");
+    query.push_bind(ROUTING_CLOCK_SKEW_SECONDS);
+    query.push(" / 86400.0)");
+    if usage_weighted {
+        query.push(
+            r#",
+            raw_windows AS (
+                SELECT
+                    window.account_id,
+                    MIN(100.0, MAX(0.0, window.used_percent)) AS used_percent,
+                    window.window_seconds,
+                    window.reset_at,
+                    julianday(window.reset_at) AS reset_jd,
+                    julianday(window.fetched_at) AS fetched_jd,
+                    clock.now_jd,
+                    clock.freshness_days,
+                    clock.skew_days
+                FROM usage_windows window
+                CROSS JOIN clock
+                WHERE window.quota_key = 'codex'
+            ),
+            classified_windows AS (
+                SELECT
+                    raw.*,
+                    CASE
+                        WHEN raw.used_percent IS NULL
+                          OR (raw.reset_at IS NOT NULL AND raw.reset_jd IS NULL)
+                          OR (raw.window_seconds IS NOT NULL AND raw.window_seconds <= 0)
+                          OR (
+                              raw.reset_jd IS NOT NULL
+                              AND raw.window_seconds IS NOT NULL
+                              AND raw.reset_jd > raw.now_jd
+                                  + CAST(raw.window_seconds AS REAL) / 86400.0
+                                  + raw.skew_days
+                          ) THEN 'unknown'
+                        WHEN raw.reset_jd IS NOT NULL
+                          AND raw.reset_jd <= raw.now_jd
+                          AND raw.reset_jd >= raw.now_jd - raw.freshness_days
+                            THEN 'reset'
+                        WHEN raw.reset_jd IS NOT NULL
+                          AND raw.reset_jd < raw.now_jd - raw.freshness_days
+                            THEN 'unknown'
+                        WHEN raw.fetched_jd IS NULL
+                          OR raw.fetched_jd < raw.now_jd - raw.freshness_days
+                          OR raw.fetched_jd > raw.now_jd + raw.skew_days
+                            THEN 'unknown'
+                        WHEN raw.reset_at IS NULL OR raw.window_seconds IS NULL
+                            THEN 'raw'
+                        ELSE 'timed'
+                    END AS score_kind
+                FROM raw_windows raw
+            ),
+            window_scores AS (
+                SELECT
+                    account_id,
+                    CASE score_kind
+                        WHEN 'timed' THEN used_percent - 100.0 * (
+                            1.0 - MIN(1.0, MAX(
+                                0.0,
+                                (reset_jd - now_jd) * 86400.0
+                                    / CAST(window_seconds AS REAL)
+                            ))
+                        )
+                        WHEN 'raw' THEN used_percent
+                        WHEN 'reset' THEN 0.0
+                        ELSE "#,
+        );
+        query.push_bind(ROUTING_UNKNOWN_PRESSURE);
+        query.push(
+            r#"
+                    END AS pressure,
+                    CASE score_kind
+                        WHEN 'unknown' THEN 2
+                        WHEN 'reset' THEN 1
+                        ELSE 0
+                    END AS telemetry_quality,
+                    CASE score_kind
+                        WHEN 'unknown' THEN "#,
+        );
+        query.push_bind(ROUTING_UNKNOWN_PRESSURE);
+        query.push(
+            r#"
+                        WHEN 'reset' THEN 0.0
+                        ELSE used_percent
+                    END AS effective_used
+                FROM classified_windows
+            ),
+            account_scores AS (
+                SELECT
+                    account_id,
+                    MAX(pressure) AS pressure,
+                    MAX(telemetry_quality) AS telemetry_quality,
+                    MAX(effective_used) AS worst_effective_used
+                FROM window_scores
+                GROUP BY account_id
+            )"#,
+        );
+    }
+    query.push(
         r#"
         UPDATE account_runtime_state
         SET last_selected_at = "#,
     );
-    query.push_bind(selected_at);
+    query.push_bind(&selected_at);
     query.push(
         r#",
             cooldown_until = NULL,
@@ -539,14 +663,26 @@ pub async fn select_account_for_request(
             SELECT a.id
             FROM accounts a
             INNER JOIN account_runtime_state r ON r.account_id = a.id
+        "#,
+    );
+    if usage_weighted {
+        query.push(" LEFT JOIN account_scores scores ON scores.account_id = a.id");
+    }
+    query.push(
+        r#"
+            CROSS JOIN clock
             WHERE a.status = 'active'
-              AND (r.cooldown_until IS NULL OR julianday(r.cooldown_until) <= julianday('now'))
+              AND (r.cooldown_until IS NULL OR julianday(r.cooldown_until) <= clock.now_jd)
               AND NOT EXISTS (
                   SELECT 1 FROM usage_windows exhausted
                   WHERE exhausted.account_id = a.id
                     AND exhausted.quota_key = 'codex'
                     AND exhausted.used_percent >= 100
-                    AND (exhausted.reset_at IS NULL OR julianday(exhausted.reset_at) > julianday('now'))
+                    AND (
+                        exhausted.reset_at IS NULL
+                        OR julianday(exhausted.reset_at) IS NULL
+                        OR julianday(exhausted.reset_at) > clock.now_jd
+                    )
               )
         "#,
     );
@@ -559,30 +695,35 @@ pub async fn select_account_for_request(
         separated.push_unseparated(")");
     }
     query.push(" ORDER BY ");
-    if settings.routing_strategy != "round_robin" {
+    if usage_weighted {
+        query.push("ROUND(COALESCE(scores.pressure, ");
+        query.push_bind(ROUTING_UNKNOWN_PRESSURE);
+        query.push(") + ");
+        query.push_bind(ROUTING_INFLIGHT_PENALTY);
         query.push(
-            r#"r.inflight_count ASC,
-                COALESCE((
-                    SELECT window.used_percent
-                    FROM usage_windows window
-                    WHERE window.account_id = a.id AND window.quota_key = 'codex'
-                    ORDER BY COALESCE(window.window_seconds, 0) DESC
-                    LIMIT 1
-                ), 0) ASC,
-                COALESCE((
-                    SELECT window.used_percent
-                    FROM usage_windows window
-                    WHERE window.account_id = a.id AND window.quota_key = 'codex'
-                    ORDER BY COALESCE(window.window_seconds, 0) ASC
-                    LIMIT 1
-                ), 0) ASC,
+            r#" * MAX(r.inflight_count, 0), 6) ASC,
+                COALESCE(scores.telemetry_quality, 2) ASC,
+                COALESCE(scores.worst_effective_used, "#,
+        );
+        query.push_bind(ROUTING_UNKNOWN_PRESSURE);
+        query.push(
+            r#") ASC,
+                MAX(r.inflight_count, 0) ASC,
             "#,
         );
     }
     query.push(
         r#"COALESCE(r.last_selected_at, '1970-01-01T00:00:00.000Z') ASC,
                  a.created_at ASC,
-                 a.rowid ASC
+        "#,
+    );
+    if usage_weighted {
+        query.push("a.id ASC");
+    } else {
+        query.push("a.rowid ASC");
+    }
+    query.push(
+        r#"
             LIMIT 1
         )
         RETURNING account_id
@@ -624,24 +765,6 @@ async fn selected_account(
     Ok(SelectedAccount { account, tokens })
 }
 
-async fn mark_selected(pool: &SqlitePool, account_id: Uuid) -> AppResult<()> {
-    sqlx::query(
-        r#"
-        UPDATE account_runtime_state
-        SET last_selected_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-            cooldown_until = NULL,
-            cooldown_reason = NULL,
-            inflight_count = inflight_count + 1,
-            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-        WHERE account_id = $1
-        "#,
-    )
-    .bind(account_id)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
 /// Account one request on an already-pinned transport, such as a reused
 /// Responses WebSocket connection, only while the account remains eligible.
 pub async fn acquire_account_if_available(pool: &SqlitePool, account_id: Uuid) -> AppResult<bool> {
@@ -672,7 +795,11 @@ pub async fn acquire_account_if_available(pool: &SqlitePool, account_id: Uuid) -
               WHERE exhausted.account_id = $1
                 AND exhausted.quota_key = 'codex'
                 AND exhausted.used_percent >= 100
-                AND (exhausted.reset_at IS NULL OR julianday(exhausted.reset_at) > julianday('now'))
+                AND (
+                    exhausted.reset_at IS NULL
+                    OR julianday(exhausted.reset_at) IS NULL
+                    OR julianday(exhausted.reset_at) > julianday('now')
+                )
           )
         RETURNING account_id
         "#,

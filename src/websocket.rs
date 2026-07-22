@@ -86,6 +86,7 @@ async fn select_and_connect(
             affinity.map(|item| (item.hash.as_str(), item.kind.as_str())),
             &excluded,
             &settings,
+            state.config.usage_refresh_interval,
         )
         .await;
         let mut selected = match selected {

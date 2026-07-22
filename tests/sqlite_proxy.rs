@@ -13,7 +13,7 @@ use axum::{
     routing::{get, post},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use chrono::Utc;
+use chrono::{Duration as ChronoDuration, Utc};
 use codex_lb_rs::{
     auth_file::{AuthFile, AuthTokens, claims_from_auth},
     build_app,
@@ -110,13 +110,30 @@ async fn sqlite_admin_and_proxy_failover_smoke() -> Result<()> {
     assert_eq!(reactivated.status, "active");
 
     let settings = db::runtime_settings(&pool).await?;
-    let first_selection =
-        db::select_account_for_request(&pool, &crypto, None, &HashSet::new(), &settings).await?;
+    let first_selection = db::select_account_for_request(
+        &pool,
+        &crypto,
+        None,
+        &HashSet::new(),
+        &settings,
+        config.usage_refresh_interval,
+    )
+    .await?;
     db::release_account(&pool, first_selection.account.id).await?;
-    let second_selection =
-        db::select_account_for_request(&pool, &crypto, None, &HashSet::new(), &settings).await?;
-    assert_eq!(first_selection.account.id, rate_limited_account);
-    assert_eq!(second_selection.account.id, good_account);
+    let second_selection = db::select_account_for_request(
+        &pool,
+        &crypto,
+        None,
+        &HashSet::new(),
+        &settings,
+        config.usage_refresh_interval,
+    )
+    .await?;
+    assert_ne!(first_selection.account.id, second_selection.account.id);
+    assert_eq!(
+        HashSet::from([first_selection.account.id, second_selection.account.id]),
+        HashSet::from([rate_limited_account, good_account])
+    );
     db::release_account(&pool, second_selection.account.id).await?;
 
     db::cooldown_account(&pool, good_account, 10, "transient upstream error").await?;
@@ -684,6 +701,383 @@ async fn migration_backfills_historical_cost_as_cache_write_range() -> Result<()
     Ok(())
 }
 
+#[tokio::test]
+async fn usage_weighted_balances_quota_pressure_and_inflight_load() -> Result<()> {
+    let storage = TestStorage::new();
+    let pool = db::connect(&storage.database_url()).await?;
+    db::run_migrations(&pool).await?;
+    let crypto = TokenCrypto::load_or_create(&storage.key_path).await?;
+    let work = insert_account(
+        &pool,
+        &crypto,
+        "routing-work-access",
+        "acct-routing-work",
+        "routing-work@example.invalid",
+    )
+    .await?;
+    let personal = insert_account(
+        &pool,
+        &crypto,
+        "routing-personal-access",
+        "acct-routing-personal",
+        "routing-personal@example.invalid",
+    )
+    .await?;
+    let now = Utc::now();
+    insert_core_window(
+        &pool,
+        work,
+        "primary",
+        59.0,
+        Some(1_000),
+        Some(now + ChronoDuration::seconds(500)),
+        now - ChronoDuration::seconds(60),
+    )
+    .await?;
+    insert_core_window(
+        &pool,
+        personal,
+        "primary",
+        8.0,
+        Some(1_000),
+        Some(now + ChronoDuration::seconds(500)),
+        now - ChronoDuration::seconds(60),
+    )
+    .await?;
+    set_inflight(&pool, work, 2).await?;
+    set_inflight(&pool, personal, 8).await?;
+
+    let settings = db::runtime_settings(&pool).await?;
+    let selected = select_for_test(&pool, &crypto, &settings, None, &HashSet::new()).await?;
+    assert_eq!(
+        selected, personal,
+        "a 51-point quota advantage should beat six additional in-flight requests"
+    );
+
+    set_inflight(&pool, personal, 30).await?;
+    let selected = select_for_test(&pool, &crypto, &settings, None, &HashSet::new()).await?;
+    assert_eq!(
+        selected, work,
+        "a sufficiently large concurrency gap should still protect an overloaded account"
+    );
+
+    pool.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn usage_weighted_uses_reset_timing_and_the_tightest_core_window() -> Result<()> {
+    let storage = TestStorage::new();
+    let pool = db::connect(&storage.database_url()).await?;
+    db::run_migrations(&pool).await?;
+    let crypto = TokenCrypto::load_or_create(&storage.key_path).await?;
+    let early_reset = insert_account(
+        &pool,
+        &crypto,
+        "early-reset-access",
+        "acct-early-reset",
+        "early-reset@example.invalid",
+    )
+    .await?;
+    let late_reset = insert_account(
+        &pool,
+        &crypto,
+        "late-reset-access",
+        "acct-late-reset",
+        "late-reset@example.invalid",
+    )
+    .await?;
+    let now = Utc::now();
+    insert_core_window(
+        &pool,
+        early_reset,
+        "primary",
+        60.0,
+        Some(1_000),
+        Some(now + ChronoDuration::seconds(100)),
+        now - ChronoDuration::seconds(60),
+    )
+    .await?;
+    insert_core_window(
+        &pool,
+        late_reset,
+        "primary",
+        20.0,
+        Some(1_000),
+        Some(now + ChronoDuration::seconds(800)),
+        now - ChronoDuration::seconds(60),
+    )
+    .await?;
+
+    let settings = db::runtime_settings(&pool).await?;
+    let selected = select_for_test(&pool, &crypto, &settings, None, &HashSet::new()).await?;
+    assert_eq!(
+        selected, early_reset,
+        "the account closer to reset has more sustainable capacity despite higher raw usage"
+    );
+
+    sqlx::query("DELETE FROM usage_windows")
+        .execute(&pool)
+        .await?;
+    let now = Utc::now();
+    for (account_id, slot, used_percent) in [
+        (early_reset, "primary", 30.0),
+        (early_reset, "secondary", 65.0),
+        (late_reset, "primary", 60.0),
+    ] {
+        insert_core_window(
+            &pool,
+            account_id,
+            slot,
+            used_percent,
+            Some(1_000),
+            Some(now + ChronoDuration::seconds(500)),
+            now - ChronoDuration::seconds(60),
+        )
+        .await?;
+    }
+    let selected = select_for_test(&pool, &crypto, &settings, None, &HashSet::new()).await?;
+    assert_eq!(
+        selected, late_reset,
+        "the most pressured core window must control each account's score"
+    );
+
+    pool.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn usage_weighted_treats_unknown_stale_and_reset_telemetry_conservatively() -> Result<()> {
+    let storage = TestStorage::new();
+    let pool = db::connect(&storage.database_url()).await?;
+    db::run_migrations(&pool).await?;
+    let crypto = TokenCrypto::load_or_create(&storage.key_path).await?;
+    let uncertain = insert_account(
+        &pool,
+        &crypto,
+        "uncertain-access",
+        "acct-uncertain",
+        "uncertain@example.invalid",
+    )
+    .await?;
+    let known = insert_account(
+        &pool,
+        &crypto,
+        "known-access",
+        "acct-known",
+        "known@example.invalid",
+    )
+    .await?;
+    let settings = db::runtime_settings(&pool).await?;
+    let now = Utc::now();
+    insert_core_window(
+        &pool,
+        known,
+        "primary",
+        95.0,
+        Some(1_000),
+        Some(now + ChronoDuration::seconds(500)),
+        now - ChronoDuration::seconds(60),
+    )
+    .await?;
+    let selected = select_for_test(&pool, &crypto, &settings, None, &HashSet::new()).await?;
+    assert_eq!(
+        selected, known,
+        "missing telemetry must not look like zero usage"
+    );
+
+    insert_core_window(
+        &pool,
+        uncertain,
+        "primary",
+        0.0,
+        Some(1_000),
+        Some(now + ChronoDuration::seconds(500)),
+        now - ChronoDuration::seconds(400),
+    )
+    .await?;
+    let selected = select_for_test(&pool, &crypto, &settings, None, &HashSet::new()).await?;
+    assert_eq!(
+        selected, known,
+        "stale telemetry must receive an unknown penalty"
+    );
+
+    sqlx::query("DELETE FROM usage_windows")
+        .execute(&pool)
+        .await?;
+    let now = Utc::now();
+    insert_core_window(
+        &pool,
+        uncertain,
+        "primary",
+        20.0,
+        None,
+        None,
+        now - ChronoDuration::seconds(60),
+    )
+    .await?;
+    insert_core_window(
+        &pool,
+        known,
+        "primary",
+        75.0,
+        Some(1_000),
+        Some(now + ChronoDuration::seconds(500)),
+        now - ChronoDuration::seconds(60),
+    )
+    .await?;
+    let selected = select_for_test(&pool, &crypto, &settings, None, &HashSet::new()).await?;
+    assert_eq!(
+        selected, uncertain,
+        "fresh usage without timing should fall back to raw percentage"
+    );
+
+    sqlx::query("DELETE FROM usage_windows")
+        .execute(&pool)
+        .await?;
+    let now = Utc::now();
+    insert_core_window(
+        &pool,
+        uncertain,
+        "primary",
+        100.0,
+        Some(1_000),
+        Some(now - ChronoDuration::seconds(60)),
+        now - ChronoDuration::seconds(60),
+    )
+    .await?;
+    insert_core_window(
+        &pool,
+        known,
+        "primary",
+        100.0,
+        Some(1_000),
+        Some(now - ChronoDuration::seconds(400)),
+        now - ChronoDuration::seconds(60),
+    )
+    .await?;
+    let selected = select_for_test(&pool, &crypto, &settings, None, &HashSet::new()).await?;
+    assert_eq!(
+        selected, uncertain,
+        "a just-reset quota should be usable while an old expired sample stays unknown"
+    );
+
+    pool.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn routing_preserves_stickiness_eligibility_failover_and_round_robin() -> Result<()> {
+    let storage = TestStorage::new();
+    let pool = db::connect(&storage.database_url()).await?;
+    db::run_migrations(&pool).await?;
+    let crypto = TokenCrypto::load_or_create(&storage.key_path).await?;
+    let pinned = insert_account(
+        &pool,
+        &crypto,
+        "pinned-access",
+        "acct-pinned",
+        "pinned@example.invalid",
+    )
+    .await?;
+    let healthy = insert_account(
+        &pool,
+        &crypto,
+        "healthy-access",
+        "acct-healthy",
+        "healthy@example.invalid",
+    )
+    .await?;
+    let settings = db::runtime_settings(&pool).await?;
+    let now = Utc::now();
+    insert_core_window(
+        &pool,
+        pinned,
+        "primary",
+        90.0,
+        Some(1_000),
+        Some(now + ChronoDuration::seconds(500)),
+        now - ChronoDuration::seconds(60),
+    )
+    .await?;
+    insert_core_window(
+        &pool,
+        healthy,
+        "primary",
+        10.0,
+        Some(1_000),
+        Some(now + ChronoDuration::seconds(500)),
+        now - ChronoDuration::seconds(60),
+    )
+    .await?;
+    let affinity_hash = db::affinity_hash("session_id", "routing-test-session");
+    db::bind_affinity(&pool, &affinity_hash, "session_id", pinned).await?;
+    let affinity = Some((affinity_hash.as_str(), "session_id"));
+    let selected = select_for_test(&pool, &crypto, &settings, affinity, &HashSet::new()).await?;
+    assert_eq!(
+        selected, pinned,
+        "eligible stateful sessions must remain sticky"
+    );
+
+    db::cooldown_account(&pool, pinned, 60, "routing test cooldown").await?;
+    let selected = select_for_test(&pool, &crypto, &settings, affinity, &HashSet::new()).await?;
+    assert_eq!(selected, healthy, "cooldown must override affinity");
+    let cooling = db::list_accounts(&pool)
+        .await?
+        .into_iter()
+        .find(|account| account.id == pinned)
+        .expect("pinned account summary");
+    assert!(
+        cooling.cooldown_until.is_some(),
+        "sticky lookup must not clear cooldown"
+    );
+
+    sqlx::query(
+        "UPDATE account_runtime_state SET cooldown_until = NULL, cooldown_reason = NULL WHERE account_id = $1",
+    )
+    .bind(pinned)
+    .execute(&pool)
+    .await?;
+    sqlx::query("UPDATE usage_windows SET used_percent = 100, reset_at = 'not-a-date' WHERE account_id = $1")
+        .bind(pinned)
+        .execute(&pool)
+        .await?;
+    let selected = select_for_test(&pool, &crypto, &settings, None, &HashSet::new()).await?;
+    assert_eq!(
+        selected, healthy,
+        "100% usage with an unknown reset must stay ineligible"
+    );
+
+    sqlx::query("UPDATE usage_windows SET used_percent = 90, reset_at = $2 WHERE account_id = $1")
+        .bind(pinned)
+        .bind(Utc::now() + ChronoDuration::seconds(500))
+        .execute(&pool)
+        .await?;
+    let mut excluded = HashSet::new();
+    excluded.insert(healthy);
+    let selected = select_for_test(&pool, &crypto, &settings, None, &excluded).await?;
+    assert_eq!(selected, pinned, "the retry exclusion set must be honored");
+
+    set_inflight(&pool, pinned, 50).await?;
+    set_inflight(&pool, healthy, 0).await?;
+    sqlx::query(
+        "UPDATE account_runtime_state SET last_selected_at = CASE WHEN account_id = $1 THEN '2020-01-01T00:00:00Z' ELSE '2021-01-01T00:00:00Z' END",
+    )
+    .bind(pinned)
+    .execute(&pool)
+    .await?;
+    let mut round_robin = settings.clone();
+    round_robin.routing_strategy = "round_robin".to_string();
+    let selected = select_for_test(&pool, &crypto, &round_robin, None, &HashSet::new()).await?;
+    assert_eq!(
+        selected, pinned,
+        "round-robin must continue to ignore quota and in-flight load"
+    );
+
+    pool.close().await;
+    Ok(())
+}
+
 async fn migrate_before_api_cost(pool: &SqlitePool) -> Result<()> {
     let migration_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations");
     let migrator = sqlx::migrate::Migrator::new(migration_dir.as_path()).await?;
@@ -724,6 +1118,69 @@ async fn insert_account(
     let claims = claims_from_auth(&auth);
     let account = db::upsert_account(pool, crypto, auth, claims, None).await?;
     Ok(account.id)
+}
+
+async fn insert_core_window(
+    pool: &SqlitePool,
+    account_id: Uuid,
+    source_slot: &str,
+    used_percent: f64,
+    window_seconds: Option<i64>,
+    reset_at: Option<chrono::DateTime<Utc>>,
+    fetched_at: chrono::DateTime<Utc>,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO usage_windows (
+            account_id, quota_key, quota_name, source_slot, window_kind,
+            used_percent, window_seconds, reset_at, fetched_at
+        ) VALUES ($1, 'codex', 'Codex', $2, $2, $3, $4, $5, $6)
+        ON CONFLICT (account_id, quota_key, source_slot) DO UPDATE SET
+            used_percent = EXCLUDED.used_percent,
+            window_seconds = EXCLUDED.window_seconds,
+            reset_at = EXCLUDED.reset_at,
+            fetched_at = EXCLUDED.fetched_at
+        "#,
+    )
+    .bind(account_id)
+    .bind(source_slot)
+    .bind(used_percent)
+    .bind(window_seconds)
+    .bind(reset_at)
+    .bind(fetched_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn set_inflight(pool: &SqlitePool, account_id: Uuid, inflight: i64) -> Result<()> {
+    sqlx::query("UPDATE account_runtime_state SET inflight_count = $2 WHERE account_id = $1")
+        .bind(account_id)
+        .bind(inflight)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+async fn select_for_test(
+    pool: &SqlitePool,
+    crypto: &TokenCrypto,
+    settings: &codex_lb_rs::models::RuntimeSettings,
+    affinity: Option<(&str, &str)>,
+    excluded: &HashSet<Uuid>,
+) -> Result<Uuid> {
+    let selected = db::select_account_for_request(
+        pool,
+        crypto,
+        affinity,
+        excluded,
+        settings,
+        Duration::from_secs(120),
+    )
+    .await?;
+    let account_id = selected.account.id;
+    db::release_account(pool, account_id).await?;
+    Ok(account_id)
 }
 
 fn jwt(payload: Value) -> String {

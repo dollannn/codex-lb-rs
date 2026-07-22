@@ -87,6 +87,7 @@ async fn proxy_request(
                 .map(|affinity| (affinity.hash.as_str(), affinity.kind.as_str())),
             &excluded,
             &settings,
+            state.config.usage_refresh_interval,
         )
         .await;
         let mut selected = match selected {
@@ -915,9 +916,15 @@ async fn proxy_models(
     let mut last_error = None;
 
     for _ in 0..attempts {
-        let selected =
-            db::select_account_for_request(&state.pool, &state.crypto, None, &excluded, &settings)
-                .await;
+        let selected = db::select_account_for_request(
+            &state.pool,
+            &state.crypto,
+            None,
+            &excluded,
+            &settings,
+            state.config.usage_refresh_interval,
+        )
+        .await;
         let mut selected = match selected {
             Ok(selected) => selected,
             Err(error) if !excluded.is_empty() => {
