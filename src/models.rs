@@ -102,6 +102,17 @@ pub struct RequestLog {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRoute {
+    pub key_hash: String,
+    pub kind: String,
+    pub account_id: Uuid,
+    pub account_label: String,
+    pub created_at: DateTime<Utc>,
+    pub last_used_at: DateTime<Utc>,
+}
+
 pub struct NewRequestLog<'a> {
     pub request_id: &'a str,
     pub account_id: Option<Uuid>,
@@ -233,6 +244,17 @@ pub struct UsageSummary {
 pub struct LogsQuery {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SessionRoutesQuery {
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolveSessionRoutesRequest {
+    pub key_hashes: Vec<String>,
 }
 
 #[cfg(test)]

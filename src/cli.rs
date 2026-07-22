@@ -1,4 +1,10 @@
-use std::{env, path::PathBuf, process::Command as ProcessCommand};
+use std::{
+    collections::{HashMap, HashSet},
+    env, fs,
+    path::{Path, PathBuf},
+    process::Command as ProcessCommand,
+    time::SystemTime,
+};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
@@ -40,6 +46,11 @@ pub enum Command {
     Logs {
         #[command(subcommand)]
         command: LogsCommand,
+    },
+    /// Inspect privacy-preserving sticky routes from local Codex sessions to accounts.
+    Sessions {
+        #[command(subcommand)]
+        command: SessionsCommand,
     },
     Settings {
         #[command(subcommand)]
@@ -132,6 +143,22 @@ pub enum LogsCommand {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum SessionsCommand {
+    /// Match recent local Codex rollout IDs to their last routed pool account.
+    List {
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// Resolve one Codex session UUID to its last routed pool account.
+    Show { session_id: Uuid },
+    /// Show current hashed routes without reading local Codex session files.
+    Routes {
+        #[arg(long, default_value_t = 100)]
+        limit: i64,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum SettingsCommand {
     Get,
     Set { key: String, value: String },
@@ -147,6 +174,7 @@ pub async fn run_api_command(cli: &Cli) -> Result<()> {
         Command::Accounts { command } => run_accounts(cli, command).await,
         Command::Usage { command } => run_usage(cli, command).await,
         Command::Logs { command } => run_logs(cli, command).await,
+        Command::Sessions { command } => run_sessions(cli, command).await,
         Command::Settings { command } => run_settings(cli, command).await,
         Command::Config {
             command: ConfigCommand::Check,
@@ -379,6 +407,133 @@ async fn run_logs(cli: &Cli, command: &LogsCommand) -> Result<()> {
     }
 }
 
+async fn run_sessions(cli: &Cli, command: &SessionsCommand) -> Result<()> {
+    match command {
+        SessionsCommand::Routes { limit } => {
+            print_response(
+                cli,
+                Method::GET,
+                &format!("/admin/session-routes?limit={}", (*limit).clamp(1, 500)),
+                None,
+            )
+            .await
+        }
+        SessionsCommand::Show { session_id } => {
+            let key_hash = crate::db::affinity_hash("session_id", &session_id.to_string());
+            let response = resolve_session_hashes(cli, std::slice::from_ref(&key_hash)).await?;
+            let route = response
+                .get("sessionRoutes")
+                .and_then(Value::as_array)
+                .and_then(|routes| routes.first())
+                .cloned();
+            print_json(&serde_json::json!({
+                "sessionId": session_id,
+                "fingerprint": &key_hash[..12],
+                "route": route,
+                "semantics": "last_routed",
+                "note": "A sticky route is not proof that the session process is currently connected."
+            }))
+        }
+        SessionsCommand::List { limit } => {
+            let limit = (*limit).clamp(1, 500);
+            let session_ids = discover_codex_session_ids(500)?;
+            let by_hash = session_ids
+                .iter()
+                .map(|session_id| {
+                    (
+                        crate::db::affinity_hash("session_id", &session_id.to_string()),
+                        *session_id,
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            let key_hashes = by_hash.keys().cloned().collect::<Vec<_>>();
+            let response = resolve_session_hashes(cli, &key_hashes).await?;
+            let sessions = response
+                .get("sessionRoutes")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|route| {
+                    let key_hash = route.get("keyHash")?.as_str()?;
+                    let session_id = by_hash.get(key_hash)?;
+                    Some(serde_json::json!({
+                        "sessionId": session_id,
+                        "fingerprint": &key_hash[..12],
+                        "account": route.get("accountLabel"),
+                        "lastRoutedAt": route.get("lastUsedAt"),
+                        "firstRoutedAt": route.get("createdAt")
+                    }))
+                })
+                .take(limit)
+                .collect::<Vec<_>>();
+            print_json(&serde_json::json!({
+                "sessions": sessions,
+                "semantics": "last_routed",
+                "note": "Raw session IDs are matched locally; the daemon stores and receives only SHA-256 hashes. A sticky route is not proof that the session process is currently connected."
+            }))
+        }
+    }
+}
+
+async fn resolve_session_hashes(cli: &Cli, key_hashes: &[String]) -> Result<Value> {
+    request(
+        cli,
+        Method::POST,
+        "/admin/session-routes",
+        Some(serde_json::json!({ "keyHashes": key_hashes })),
+    )
+    .await
+}
+
+fn discover_codex_session_ids(limit: usize) -> Result<Vec<Uuid>> {
+    let codex_home = env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+        .context("neither CODEX_HOME nor HOME is set")?;
+    let root = codex_home.join("sessions");
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut directories = vec![root];
+    let mut discovered = Vec::new();
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(&directory)
+            .with_context(|| format!("reading Codex session directory {}", directory.display()))?
+        {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                directories.push(entry.path());
+            } else if file_type.is_file()
+                && let Some(session_id) = session_id_from_rollout_path(&entry.path())
+            {
+                let modified = entry
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                discovered.push((modified, session_id));
+            }
+        }
+    }
+    discovered.sort_by_key(|item| std::cmp::Reverse(item.0));
+    let mut seen = HashSet::new();
+    Ok(discovered
+        .into_iter()
+        .filter_map(|(_, session_id)| seen.insert(session_id).then_some(session_id))
+        .take(limit)
+        .collect())
+}
+
+fn session_id_from_rollout_path(path: &Path) -> Option<Uuid> {
+    if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+        return None;
+    }
+    let stem = path.file_stem()?.to_str()?;
+    let session_id = stem.get(stem.len().checked_sub(36)?..)?;
+    Uuid::parse_str(session_id).ok()
+}
+
 async fn run_settings(cli: &Cli, command: &SettingsCommand) -> Result<()> {
     match command {
         SettingsCommand::Get => print_response(cli, Method::GET, "/admin/settings", None).await,
@@ -430,4 +585,29 @@ async fn request(cli: &Cli, method: Method, path: &str, body: Option<Value>) -> 
 fn print_json(value: &Value) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::session_id_from_rollout_path;
+
+    #[test]
+    fn reads_session_id_from_rollout_filename() {
+        let session_id = session_id_from_rollout_path(Path::new(
+            "rollout-2026-07-22T12-00-00-019f8a00-1234-7abc-8def-0123456789ab.jsonl",
+        ));
+        assert_eq!(
+            session_id.map(|value| value.to_string()).as_deref(),
+            Some("019f8a00-1234-7abc-8def-0123456789ab")
+        );
+        assert_eq!(session_id_from_rollout_path(Path::new("notes.jsonl")), None);
+        assert_eq!(
+            session_id_from_rollout_path(Path::new(
+                "rollout-2026-07-22T12-00-00-019f8a00-1234-7abc-8def-0123456789ab.txt",
+            )),
+            None
+        );
+    }
 }

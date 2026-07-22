@@ -12,7 +12,6 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
@@ -54,7 +53,7 @@ pub async fn proxy_responses(
     let mut response = upgrade
         .max_message_size(MAX_MESSAGE_SIZE)
         .max_frame_size(MAX_MESSAGE_SIZE)
-        .on_upgrade(move |client| bridge(state, client, upstream_socket, account_id));
+        .on_upgrade(move |client| bridge(state, client, upstream_socket, account_id, affinity));
     copy_upstream_handshake_headers(&upstream_headers, response.headers_mut());
     Ok(response)
 }
@@ -272,6 +271,7 @@ async fn bridge(
     mut client: WebSocket,
     mut upstream_socket: UpstreamSocket,
     account_id: Uuid,
+    affinity: Option<AffinityKey>,
 ) {
     let mut active_turn: Option<ActiveTurn> = None;
     let idle_timeout = state.config.request_timeout;
@@ -319,7 +319,20 @@ async fn bridge(
                         ).await;
                     }
                     match start_turn(&state, account_id, request).await {
-                        Ok(turn) => active_turn = Some(turn),
+                        Ok(turn) => {
+                            if let Some(affinity) = affinity.as_ref()
+                                && let Err(error) = db::bind_affinity(
+                                    &state.pool,
+                                    &affinity.hash,
+                                    &affinity.kind,
+                                    account_id,
+                                )
+                                .await
+                            {
+                                tracing::warn!(%account_id, %error, "failed to refresh WebSocket session route");
+                            }
+                            active_turn = Some(turn);
+                        }
                         Err(error) => {
                             tracing::warn!(%account_id, %error, "failed to account WebSocket request");
                             break "local request accounting failed";
@@ -668,12 +681,8 @@ fn websocket_affinity(headers: &HeaderMap) -> Option<AffinityKey> {
 
 impl AffinityKey {
     fn new(kind: &str, value: &str) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(kind.as_bytes());
-        hasher.update([0]);
-        hasher.update(value.as_bytes());
         Self {
-            hash: format!("{:x}", hasher.finalize()),
+            hash: db::affinity_hash(kind, value),
             kind: kind.to_string(),
         }
     }

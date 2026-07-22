@@ -8,6 +8,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use sqlx::{
     QueryBuilder, Sqlite, SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
@@ -20,8 +21,8 @@ use crate::{
     error::{AppError, AppResult},
     models::{
         Account, AccountSummary, AccountTokens, LogsQuery, NewRequestLog, RequestLog,
-        RuntimeSettings, SelectedAccount, SettingRow, UsageSample, UsageSnapshot, UsageSummary,
-        UsageWindow,
+        RuntimeSettings, SelectedAccount, SessionRoute, SettingRow, UsageSample, UsageSnapshot,
+        UsageSummary, UsageWindow,
     },
     usage::ParsedUsageWindow,
 };
@@ -557,6 +558,79 @@ pub async fn bind_affinity(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+pub fn affinity_hash(kind: &str, value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(kind.as_bytes());
+    hasher.update([0]);
+    hasher.update(value.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+pub async fn list_session_routes(
+    pool: &SqlitePool,
+    limit: i64,
+    sticky_ttl_seconds: i64,
+) -> AppResult<Vec<SessionRoute>> {
+    sqlx::query_as::<_, SessionRoute>(
+        r#"
+        SELECT
+            af.key_hash,
+            af.kind,
+            af.account_id,
+            CASE WHEN a.label = '' THEN 'account-' || substr(hex(a.id), 1, 8) ELSE a.label END AS account_label,
+            af.created_at,
+            af.last_used_at
+        FROM affinity af
+        INNER JOIN accounts a ON a.id = af.account_id
+        WHERE af.kind IN ('session_id', 'thread_id', 'conversation_id')
+          AND julianday(af.last_used_at) >= julianday('now', printf('-%d seconds', $1))
+        ORDER BY julianday(af.last_used_at) DESC, af.key_hash ASC
+        LIMIT $2
+        "#,
+    )
+    .bind(sticky_ttl_seconds.max(1))
+    .bind(limit.clamp(1, 500))
+    .fetch_all(pool)
+    .await
+    .map_err(AppError::Database)
+}
+
+pub async fn resolve_session_routes(
+    pool: &SqlitePool,
+    key_hashes: &[String],
+    sticky_ttl_seconds: i64,
+) -> AppResult<Vec<SessionRoute>> {
+    if key_hashes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut query = QueryBuilder::<Sqlite>::new(
+        r#"
+        SELECT
+            af.key_hash,
+            af.kind,
+            af.account_id,
+            CASE WHEN a.label = '' THEN 'account-' || substr(hex(a.id), 1, 8) ELSE a.label END AS account_label,
+            af.created_at,
+            af.last_used_at
+        FROM affinity af
+        INNER JOIN accounts a ON a.id = af.account_id
+        WHERE af.kind IN ('session_id', 'thread_id', 'conversation_id')
+          AND julianday(af.last_used_at) >= julianday('now', printf('-%d seconds', "#,
+    );
+    query.push_bind(sticky_ttl_seconds.max(1));
+    query.push(")) AND af.key_hash IN (");
+    let mut separated = query.separated(", ");
+    for key_hash in key_hashes.iter().take(500) {
+        separated.push_bind(key_hash);
+    }
+    separated.push_unseparated(") ORDER BY julianday(af.last_used_at) DESC, af.key_hash ASC");
+    query
+        .build_query_as::<SessionRoute>()
+        .fetch_all(pool)
+        .await
+        .map_err(AppError::Database)
 }
 
 pub async fn account_count(pool: &SqlitePool) -> AppResult<i64> {

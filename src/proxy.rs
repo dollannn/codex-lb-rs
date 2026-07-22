@@ -10,7 +10,6 @@ use axum::{
 use chrono::{Duration as ChronoDuration, Utc};
 use futures_util::StreamExt;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
@@ -562,12 +561,8 @@ fn request_affinity(headers: &HeaderMap, body: &[u8]) -> Option<AffinityKey> {
 
 impl AffinityKey {
     fn new(kind: &str, value: &str) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(kind.as_bytes());
-        hasher.update([0]);
-        hasher.update(value.as_bytes());
         Self {
-            hash: format!("{:x}", hasher.finalize()),
+            hash: db::affinity_hash(kind, value),
             kind: kind.to_string(),
         }
     }

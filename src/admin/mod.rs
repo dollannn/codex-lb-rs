@@ -14,7 +14,7 @@ use crate::{
     auth_file::parse_auth_json,
     db,
     error::{AppError, AppResult},
-    models::{AccountUpdateRequest, LogsQuery},
+    models::{AccountUpdateRequest, LogsQuery, ResolveSessionRoutesRequest, SessionRoutesQuery},
     state::AppState,
     upstream,
 };
@@ -32,6 +32,10 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/usage/accounts/{id}", get(account_usage))
         .route("/usage/refresh", post(refresh_all_usage))
         .route("/request-logs", get(request_logs))
+        .route(
+            "/session-routes",
+            get(session_routes).post(resolve_session_routes),
+        )
         .route("/settings", get(settings).put(update_settings))
         .route_layer(middleware::from_fn_with_state(state, admin_auth))
 }
@@ -202,6 +206,56 @@ async fn request_logs(
 ) -> AppResult<Json<Value>> {
     let logs = db::list_request_logs(&state.pool, query).await?;
     Ok(Json(serde_json::json!({ "requestLogs": logs })))
+}
+
+async fn session_routes(
+    State(state): State<AppState>,
+    Query(query): Query<SessionRoutesQuery>,
+) -> AppResult<Json<Value>> {
+    let settings = db::runtime_settings(&state.pool).await?;
+    let routes = db::list_session_routes(
+        &state.pool,
+        query.limit.unwrap_or(100),
+        settings.sticky_session_ttl_seconds,
+    )
+    .await?;
+    Ok(Json(serde_json::json!({
+        "sessionRoutes": routes,
+        "stickyTtlSeconds": settings.sticky_session_ttl_seconds,
+        "semantics": "last_routed"
+    })))
+}
+
+async fn resolve_session_routes(
+    State(state): State<AppState>,
+    Json(payload): Json<ResolveSessionRoutesRequest>,
+) -> AppResult<Json<Value>> {
+    if payload.key_hashes.len() > 500 {
+        return Err(AppError::BadRequest(
+            "at most 500 session hashes can be resolved at once".to_string(),
+        ));
+    }
+    if payload
+        .key_hashes
+        .iter()
+        .any(|hash| hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        return Err(AppError::BadRequest(
+            "session hashes must be 64 hexadecimal characters".to_string(),
+        ));
+    }
+    let settings = db::runtime_settings(&state.pool).await?;
+    let routes = db::resolve_session_routes(
+        &state.pool,
+        &payload.key_hashes,
+        settings.sticky_session_ttl_seconds,
+    )
+    .await?;
+    Ok(Json(serde_json::json!({
+        "sessionRoutes": routes,
+        "stickyTtlSeconds": settings.sticky_session_ttl_seconds,
+        "semantics": "last_routed"
+    })))
 }
 
 async fn settings(State(state): State<AppState>) -> AppResult<Json<Value>> {

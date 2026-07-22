@@ -473,6 +473,42 @@ async fn sqlite_admin_and_proxy_failover_smoke() -> Result<()> {
     assert_eq!(websocket_log.output_tokens, Some(17));
     assert_eq!(websocket_log.cached_input_tokens, Some(5));
     assert_eq!(websocket_log.reasoning_tokens, Some(7));
+
+    let session_hash = db::affinity_hash("session_id", "integration-session");
+    let session_routes: Value = client
+        .post(format!("{}/admin/session-routes", app_server.base_url))
+        .bearer_auth(ADMIN_TOKEN)
+        .json(&json!({"keyHashes": [session_hash]}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let session_route = session_routes["sessionRoutes"]
+        .as_array()
+        .and_then(|routes| routes.first())
+        .expect("resolved WebSocket session route");
+    assert_eq!(session_route["keyHash"], session_hash);
+    assert_eq!(session_route["accountId"], good_account.to_string());
+    assert_eq!(session_routes["semantics"], "last_routed");
+    assert!(!session_routes.to_string().contains("integration-session"));
+    let raw_session_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM affinity WHERE key_hash = 'integration-session' OR key_hash LIKE '%integration-session%'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(raw_session_rows, 0);
+
+    let invalid_session_hash = client
+        .post(format!("{}/admin/session-routes", app_server.base_url))
+        .bearer_auth(ADMIN_TOKEN)
+        .json(&json!({"keyHashes": ["not-a-hash"]}))
+        .send()
+        .await?;
+    assert_eq!(
+        invalid_session_hash.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
     let authorizations = fake_upstream.authorizations().await;
     assert_eq!(
         &authorizations[authorizations.len() - 3..],

@@ -223,7 +223,11 @@ codex-lb-rs accounts refresh-usage <account-id>
 codex-lb-rs usage summary
 codex-lb-rs usage refresh
 codex-lb-rs logs list --limit 50
+codex-lb-rs sessions list
+codex-lb-rs sessions show <codex-session-id>
 ```
+
+`sessions list` matches local Codex rollout UUIDs to the pool's current sticky routes and reports the last account each session was routed through. `sessions show` resolves one known UUID, while `sessions routes` shows privacy-preserving route fingerprints when the local rollout file is unavailable. Raw session IDs never enter SQLite or the admin API: the CLI hashes them locally before lookup. A route is retained for the configured sticky-session TTL, so “last routed” does not necessarily mean that the corresponding process is connected right now.
 
 Runtime settings are stored in SQLite and apply without a daemon restart:
 
