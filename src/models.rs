@@ -113,6 +113,7 @@ pub struct RequestLog {
     pub api_cost_lower_nano_usd: Option<i64>,
     pub api_cost_upper_nano_usd: Option<i64>,
     pub latency_ms: Option<i32>,
+    pub selection_reason: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -132,10 +133,32 @@ pub struct NewRequestLog<'a> {
     pub account_id: Option<Uuid>,
     pub model: Option<&'a str>,
     pub status: &'a str,
+    pub selection_reason: Option<SelectionReason>,
     pub error_code: Option<&'a str>,
     pub error_message: Option<&'a str>,
     pub usage: UsageData,
     pub latency_ms: Option<i32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionReason {
+    Sticky,
+    UsageWeighted,
+    RoundRobin,
+    Failover,
+    WebsocketReuse,
+}
+
+impl SelectionReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sticky => "sticky",
+            Self::UsageWeighted => "usage_weighted",
+            Self::RoundRobin => "round_robin",
+            Self::Failover => "failover",
+            Self::WebsocketReuse => "websocket_reuse",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, FromRow)]
@@ -225,6 +248,7 @@ pub struct AccountTokens {
 pub struct SelectedAccount {
     pub account: Account,
     pub tokens: AccountTokens,
+    pub selection_reason: SelectionReason,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

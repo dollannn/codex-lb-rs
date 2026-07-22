@@ -1,4 +1,13 @@
-use std::{collections::HashSet, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use anyhow::Result;
 use axum::{
@@ -20,7 +29,7 @@ use codex_lb_rs::{
     config::Config,
     crypto::TokenCrypto,
     db,
-    models::LogsQuery,
+    models::{LogsQuery, SelectionReason},
     state::AppState,
 };
 use futures_util::{SinkExt, StreamExt};
@@ -301,11 +310,13 @@ async fn sqlite_admin_and_proxy_failover_smoke() -> Result<()> {
     assert!(logs.iter().any(|log| {
         log.account_id == Some(rate_limited_account)
             && log.status == "error"
+            && log.selection_reason.as_deref() == Some("usage_weighted")
             && log.error_code.as_deref() == Some("rate_limited")
     }));
     assert!(logs.iter().any(|log| {
         log.account_id == Some(good_account)
             && log.status == "success"
+            && log.selection_reason.as_deref() == Some("failover")
             && log.input_tokens == Some(1_200)
             && log.output_tokens == Some(11)
             && log.cached_input_tokens == Some(200)
@@ -317,6 +328,24 @@ async fn sqlite_admin_and_proxy_failover_smoke() -> Result<()> {
             && log.api_cost_lower_nano_usd == Some(5_555_000)
             && log.api_cost_upper_nano_usd == Some(5_555_000)
     }));
+    let request_logs_json: Value = client
+        .get(format!(
+            "{}/admin/request-logs?limit=10",
+            app_server.base_url
+        ))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(
+        request_logs_json["requestLogs"]
+            .as_array()
+            .is_some_and(|logs| logs
+                .iter()
+                .any(|log| { log["selection_reason"].as_str() == Some("failover") }))
+    );
 
     let accounts = db::list_accounts(&pool).await?;
     let good_summary = accounts
@@ -495,22 +524,60 @@ async fn sqlite_admin_and_proxy_failover_smoke() -> Result<()> {
         completed,
         "local WebSocket did not forward response.completed"
     );
+
+    let websocket_reuse_payload = json!({
+        "type": "response.create",
+        "model": "gpt-ws-test",
+        "stream": true,
+        "input": [],
+        "client_metadata": {"turn_id": "integration-ws-reuse"}
+    })
+    .to_string();
+    websocket
+        .send(ClientWebSocketMessage::Text(websocket_reuse_payload.into()))
+        .await?;
+    let mut reuse_completed = false;
+    while let Some(message) = websocket.next().await {
+        let ClientWebSocketMessage::Text(text) = message? else {
+            continue;
+        };
+        let event: Value = serde_json::from_str(text.as_str())?;
+        if event.get("type").and_then(Value::as_str) == Some("response.completed") {
+            reuse_completed = true;
+            break;
+        }
+    }
+    assert!(
+        reuse_completed,
+        "reused local WebSocket did not forward response.completed"
+    );
     websocket.close(None).await?;
 
-    let websocket_log = db::list_request_logs(
+    let websocket_logs = db::list_request_logs(
         &pool,
         LogsQuery {
-            limit: Some(1),
+            limit: Some(10),
             offset: None,
         },
     )
-    .await?
-    .pop()
-    .expect("WebSocket request log");
+    .await?;
+    let websocket_log = websocket_logs
+        .iter()
+        .find(|log| log.request_id == "integration-ws-turn" && log.status == "success")
+        .expect("first successful WebSocket request log");
+    let websocket_reuse_log = websocket_logs
+        .iter()
+        .find(|log| log.request_id == "integration-ws-reuse" && log.status == "success")
+        .expect("reused WebSocket request log");
     assert_eq!(websocket_log.request_id, "integration-ws-turn");
     assert_eq!(websocket_log.account_id, Some(good_account));
     assert_eq!(websocket_log.model.as_deref(), Some("gpt-ws-test"));
     assert_eq!(websocket_log.status, "success");
+    assert_eq!(websocket_log.selection_reason.as_deref(), Some("sticky"));
+    assert_eq!(
+        websocket_reuse_log.selection_reason.as_deref(),
+        Some("websocket_reuse")
+    );
     assert_eq!(websocket_log.input_tokens, Some(1_300));
     assert_eq!(websocket_log.output_tokens, Some(17));
     assert_eq!(websocket_log.cached_input_tokens, Some(500));
@@ -577,6 +644,34 @@ async fn sqlite_admin_and_proxy_failover_smoke() -> Result<()> {
     let (mut restart_websocket, restart_response) =
         connect_async(proxy_websocket_request(&app_server.base_url)?).await?;
     assert_eq!(restart_response.status(), StatusCode::SWITCHING_PROTOCOLS);
+    let active_restart_payload = json!({
+        "type": "response.create",
+        "model": "gpt-ws-test",
+        "stream": true,
+        "input": [],
+        "client_metadata": {"turn_id": "integration-ws-restart-active"}
+    })
+    .to_string();
+    restart_websocket
+        .send(ClientWebSocketMessage::Text(active_restart_payload.into()))
+        .await?;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(message) = restart_websocket.next().await {
+            if let ClientWebSocketMessage::Text(text) = message? {
+                let event: Value = serde_json::from_str(text.as_str())?;
+                if event.get("type").and_then(Value::as_str) == Some("response.created") {
+                    return Ok::<_, anyhow::Error>(());
+                }
+            }
+        }
+        anyhow::bail!("active restart turn ended before response.created")
+    })
+    .await??;
+    let restart_config = (*state.config).clone();
+    let mut shutdown_write_blocker = pool.begin().await?;
+    sqlx::query("UPDATE settings SET updated_at = updated_at WHERE key = 'routing_strategy'")
+        .execute(&mut *shutdown_write_blocker)
+        .await?;
     let shutdown_started = std::time::Instant::now();
     state.signal_shutdown();
     let restart_close = tokio::time::timeout(Duration::from_secs(2), async {
@@ -592,6 +687,7 @@ async fn sqlite_admin_and_proxy_failover_smoke() -> Result<()> {
     assert_eq!(u16::from(restart_close.code), 1012);
     assert_eq!(restart_close.reason, "service restart");
     assert!(shutdown_started.elapsed() < Duration::from_secs(2));
+    shutdown_write_blocker.rollback().await?;
 
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
@@ -609,7 +705,105 @@ async fn sqlite_admin_and_proxy_failover_smoke() -> Result<()> {
     })
     .await?;
 
+    let restart_log = db::list_request_logs(
+        &pool,
+        LogsQuery {
+            limit: Some(10),
+            offset: None,
+        },
+    )
+    .await?
+    .into_iter()
+    .find(|log| log.request_id == "integration-ws-restart-active")
+    .expect("active turn interrupted by restart should be logged");
+    assert_eq!(restart_log.status, "error");
+    assert_eq!(restart_log.error_code.as_deref(), Some("service_restart"));
+    assert_eq!(restart_log.selection_reason.as_deref(), Some("sticky"));
+
     drop(app_server);
+    drop(state);
+    pool.close().await;
+    let pool = db::connect(&database_url).await?;
+    db::run_migrations(&pool).await?;
+    db::reset_inflight(&pool).await?;
+    let restarted_state = AppState::new(restart_config, pool.clone(), crypto.clone());
+    let restarted_server = TestServer::start(build_app(restarted_state.clone())).await?;
+    let (mut reconnected_websocket, reconnected_response) =
+        connect_async(proxy_websocket_request(&restarted_server.base_url)?).await?;
+    assert_eq!(
+        reconnected_response.status(),
+        StatusCode::SWITCHING_PROTOCOLS
+    );
+    let after_restart_payload = json!({
+        "type": "response.create",
+        "model": "gpt-ws-test",
+        "stream": true,
+        "input": [],
+        "client_metadata": {"turn_id": "integration-ws-restart-active"}
+    })
+    .to_string();
+    reconnected_websocket
+        .send(ClientWebSocketMessage::Text(after_restart_payload.into()))
+        .await?;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(message) = reconnected_websocket.next().await {
+            if let ClientWebSocketMessage::Text(text) = message? {
+                let event: Value = serde_json::from_str(text.as_str())?;
+                if event.get("type").and_then(Value::as_str) == Some("response.completed") {
+                    return Ok::<_, anyhow::Error>(());
+                }
+            }
+        }
+        anyhow::bail!("reconnected turn ended before response.completed")
+    })
+    .await??;
+    reconnected_websocket.close(None).await?;
+
+    let restart_attempts = db::list_request_logs(
+        &pool,
+        LogsQuery {
+            limit: Some(10),
+            offset: None,
+        },
+    )
+    .await?
+    .into_iter()
+    .filter(|log| log.request_id == "integration-ws-restart-active")
+    .collect::<Vec<_>>();
+    assert_eq!(
+        restart_attempts.len(),
+        2,
+        "a replayed turn should have exactly one interrupted and one successful attempt"
+    );
+    let after_restart_log = restart_attempts
+        .iter()
+        .find(|log| log.status == "success")
+        .expect("successful replay after restart should be logged");
+    assert_eq!(
+        restart_attempts
+            .iter()
+            .filter(|log| {
+                log.status == "error" && log.error_code.as_deref() == Some("service_restart")
+            })
+            .count(),
+        1
+    );
+    assert_eq!(after_restart_log.status, "success");
+    assert_eq!(after_restart_log.account_id, Some(good_account));
+    assert_eq!(
+        after_restart_log.selection_reason.as_deref(),
+        Some("sticky")
+    );
+    let rebound_account: Uuid =
+        sqlx::query_scalar("SELECT account_id FROM affinity WHERE key_hash = $1")
+            .bind(&session_hash)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(rebound_account, good_account);
+
+    restarted_state.signal_shutdown();
+    drop(restarted_server);
+    drop(restarted_state);
     pool.close().await;
     Ok(())
 }
@@ -681,6 +875,7 @@ async fn migration_backfills_historical_cost_as_cache_write_range() -> Result<()
     .await?
     .pop()
     .expect("backfilled request log");
+    assert_eq!(log.selection_reason, None);
     assert_eq!(log.api_cost_status.as_deref(), Some("missing_cache_write"));
     assert_eq!(log.api_cost_lower_nano_usd, Some(5_430_000));
     assert_eq!(log.api_cost_upper_nano_usd, Some(6_680_000));
@@ -1013,15 +1208,19 @@ async fn routing_preserves_stickiness_eligibility_failover_and_round_robin() -> 
     let affinity_hash = db::affinity_hash("session_id", "routing-test-session");
     db::bind_affinity(&pool, &affinity_hash, "session_id", pinned).await?;
     let affinity = Some((affinity_hash.as_str(), "session_id"));
-    let selected = select_for_test(&pool, &crypto, &settings, affinity, &HashSet::new()).await?;
+    let (selected, reason) =
+        select_with_reason_for_test(&pool, &crypto, &settings, affinity, &HashSet::new()).await?;
     assert_eq!(
         selected, pinned,
         "eligible stateful sessions must remain sticky"
     );
+    assert_eq!(reason, SelectionReason::Sticky);
 
     db::cooldown_account(&pool, pinned, 60, "routing test cooldown").await?;
-    let selected = select_for_test(&pool, &crypto, &settings, affinity, &HashSet::new()).await?;
+    let (selected, reason) =
+        select_with_reason_for_test(&pool, &crypto, &settings, affinity, &HashSet::new()).await?;
     assert_eq!(selected, healthy, "cooldown must override affinity");
+    assert_eq!(reason, SelectionReason::UsageWeighted);
     let cooling = db::list_accounts(&pool)
         .await?
         .into_iter()
@@ -1042,11 +1241,13 @@ async fn routing_preserves_stickiness_eligibility_failover_and_round_robin() -> 
         .bind(pinned)
         .execute(&pool)
         .await?;
-    let selected = select_for_test(&pool, &crypto, &settings, None, &HashSet::new()).await?;
+    let (selected, reason) =
+        select_with_reason_for_test(&pool, &crypto, &settings, None, &HashSet::new()).await?;
     assert_eq!(
         selected, healthy,
         "100% usage with an unknown reset must stay ineligible"
     );
+    assert_eq!(reason, SelectionReason::UsageWeighted);
 
     sqlx::query("UPDATE usage_windows SET used_percent = 90, reset_at = $2 WHERE account_id = $1")
         .bind(pinned)
@@ -1054,9 +1255,14 @@ async fn routing_preserves_stickiness_eligibility_failover_and_round_robin() -> 
         .execute(&pool)
         .await?;
     let mut excluded = HashSet::new();
-    excluded.insert(healthy);
-    let selected = select_for_test(&pool, &crypto, &settings, None, &excluded).await?;
-    assert_eq!(selected, pinned, "the retry exclusion set must be honored");
+    excluded.insert(pinned);
+    let (selected, reason) =
+        select_with_reason_for_test(&pool, &crypto, &settings, affinity, &excluded).await?;
+    assert_eq!(
+        selected, healthy,
+        "a failed sticky account must be excluded on retry"
+    );
+    assert_eq!(reason, SelectionReason::Failover);
 
     set_inflight(&pool, pinned, 50).await?;
     set_inflight(&pool, healthy, 0).await?;
@@ -1068,11 +1274,13 @@ async fn routing_preserves_stickiness_eligibility_failover_and_round_robin() -> 
     .await?;
     let mut round_robin = settings.clone();
     round_robin.routing_strategy = "round_robin".to_string();
-    let selected = select_for_test(&pool, &crypto, &round_robin, None, &HashSet::new()).await?;
+    let (selected, reason) =
+        select_with_reason_for_test(&pool, &crypto, &round_robin, None, &HashSet::new()).await?;
     assert_eq!(
         selected, pinned,
         "round-robin must continue to ignore quota and in-flight load"
     );
+    assert_eq!(reason, SelectionReason::RoundRobin);
 
     pool.close().await;
     Ok(())
@@ -1169,6 +1377,20 @@ async fn select_for_test(
     affinity: Option<(&str, &str)>,
     excluded: &HashSet<Uuid>,
 ) -> Result<Uuid> {
+    Ok(
+        select_with_reason_for_test(pool, crypto, settings, affinity, excluded)
+            .await?
+            .0,
+    )
+}
+
+async fn select_with_reason_for_test(
+    pool: &SqlitePool,
+    crypto: &TokenCrypto,
+    settings: &codex_lb_rs::models::RuntimeSettings,
+    affinity: Option<(&str, &str)>,
+    excluded: &HashSet<Uuid>,
+) -> Result<(Uuid, SelectionReason)> {
     let selected = db::select_account_for_request(
         pool,
         crypto,
@@ -1179,8 +1401,9 @@ async fn select_for_test(
     )
     .await?;
     let account_id = selected.account.id;
+    let selection_reason = selected.selection_reason;
     db::release_account(pool, account_id).await?;
-    Ok(account_id)
+    Ok((account_id, selection_reason))
 }
 
 fn jwt(payload: Value) -> String {
@@ -1272,6 +1495,7 @@ fn spawn_server(listener: TcpListener, app: Router) -> JoinHandle<()> {
 #[derive(Default)]
 struct FakeUpstreamState {
     authorizations: Mutex<Vec<String>>,
+    restart_turn_held: AtomicBool,
 }
 
 struct FakeUpstream {
@@ -1403,6 +1627,19 @@ async fn fake_responses_websocket(
                 .await
                 .is_err()
             {
+                break;
+            }
+            if request
+                .pointer("/client_metadata/turn_id")
+                .and_then(Value::as_str)
+                == Some("integration-ws-restart-active")
+                && !state.restart_turn_held.swap(true, Ordering::SeqCst)
+            {
+                while let Some(message) = socket.recv().await {
+                    if matches!(message, Ok(AxumWebSocketMessage::Close(_)) | Err(_)) {
+                        break;
+                    }
+                }
                 break;
             }
             if socket

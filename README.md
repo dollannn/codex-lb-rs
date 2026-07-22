@@ -246,6 +246,8 @@ codex-lb-rs settings set usage_sample_retention_days 30
 
 `usage_weighted` is the default. For each available account it compares every core Codex quota window with the fraction of that window that has elapsed, uses the most pressured window, and adds a small in-flight-request penalty. This favors the account most likely to sustain the current pool until its next reset without letting a heavily loaded account absorb unlimited concurrent work. Missing or stale quota data is treated conservatively instead of looking like unused capacity. Sticky session keys still keep stateful conversations on one account when possible. `round_robin` is also available.
 
+Request logs include a privacy-safe `selection_reason`: `sticky`, `usage_weighted`, `round_robin`, `failover`, or `websocket_reuse`. The reason describes the routing path without storing a session key or affinity hash.
+
 ## Local development
 
 No external database is needed:

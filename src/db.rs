@@ -21,8 +21,8 @@ use crate::{
     error::{AppError, AppResult},
     models::{
         Account, AccountSummary, AccountTokens, LogsQuery, NewRequestLog, RequestLog,
-        RuntimeSettings, SelectedAccount, SessionRoute, SettingRow, UsageData, UsageSample,
-        UsageSnapshot, UsageSummary, UsageWindow,
+        RuntimeSettings, SelectedAccount, SelectionReason, SessionRoute, SettingRow, UsageData,
+        UsageSample, UsageSnapshot, UsageSummary, UsageWindow,
     },
     pricing::{self, ApiCostStatus, PRICING_VERSION},
     usage::ParsedUsageWindow,
@@ -525,7 +525,12 @@ pub async fn select_account_for_request(
             // Re-check and acquire in one UPDATE so a cooldown or pause applied
             // after the affinity lookup cannot be cleared by the sticky path.
             if acquire_account_if_available(pool, account_id).await? {
-                return match selected_account(pool, crypto, account_id).await {
+                let reason = if excluded.is_empty() {
+                    SelectionReason::Sticky
+                } else {
+                    SelectionReason::Failover
+                };
+                return match selected_account(pool, crypto, account_id, reason).await {
                     Ok(selected) => Ok(selected),
                     Err(error) => {
                         release_account(pool, account_id).await.ok();
@@ -740,7 +745,14 @@ pub async fn select_account_for_request(
         })?;
     tx.commit().await?;
 
-    match selected_account(pool, crypto, account_id).await {
+    let reason = if !excluded.is_empty() {
+        SelectionReason::Failover
+    } else if usage_weighted {
+        SelectionReason::UsageWeighted
+    } else {
+        SelectionReason::RoundRobin
+    };
+    match selected_account(pool, crypto, account_id, reason).await {
         Ok(selected) => Ok(selected),
         Err(error) => {
             release_account(pool, account_id).await.ok();
@@ -753,6 +765,7 @@ async fn selected_account(
     pool: &SqlitePool,
     crypto: &TokenCrypto,
     account_id: Uuid,
+    selection_reason: SelectionReason,
 ) -> AppResult<SelectedAccount> {
     let account = get_account(pool, account_id)
         .await?
@@ -762,7 +775,11 @@ async fn selected_account(
         refresh_token: crypto.decrypt(&account.encrypted_refresh_token)?,
         id_token: crypto.decrypt(&account.encrypted_id_token)?,
     };
-    Ok(SelectedAccount { account, tokens })
+    Ok(SelectedAccount {
+        account,
+        tokens,
+        selection_reason,
+    })
 }
 
 /// Account one request on an already-pinned transport, such as a reused
@@ -1022,18 +1039,19 @@ pub async fn insert_request_log(pool: &SqlitePool, entry: NewRequestLog<'_>) -> 
     sqlx::query(
         r#"
         INSERT INTO request_logs (
-            request_id, account_id, model, status, error_code, error_message,
+            request_id, account_id, model, status, selection_reason, error_code, error_message,
             input_tokens, output_tokens, cached_input_tokens, cache_write_input_tokens,
             reasoning_tokens, effective_model, effective_service_tier,
             api_pricing_version, api_cost_status, api_cost_lower_nano_usd,
             api_cost_upper_nano_usd, latency_ms
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
         "#,
     )
     .bind(entry.request_id)
     .bind(entry.account_id)
     .bind(entry.model)
     .bind(entry.status)
+    .bind(entry.selection_reason.map(SelectionReason::as_str))
     .bind(entry.error_code)
     .bind(entry.error_message)
     .bind(input_tokens)

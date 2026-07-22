@@ -16,7 +16,7 @@ use uuid::Uuid;
 use crate::{
     db,
     error::{AppError, AppResult},
-    models::{AccountTokens, NewRequestLog, SelectedAccount, UsageData},
+    models::{AccountTokens, NewRequestLog, SelectedAccount, SelectionReason, UsageData},
     state::AppState,
     upstream,
 };
@@ -99,6 +99,7 @@ async fn proxy_request(
             Err(error) => return Err(error),
         };
         let account_id = selected.account.id;
+        let selection_reason = selected.selection_reason;
         let lease = AccountLease::new(state.pool.clone(), account_id);
         maybe_refresh_selected(&state, &mut selected).await;
 
@@ -124,6 +125,7 @@ async fn proxy_request(
                     &state,
                     &request_id,
                     account_id,
+                    selection_reason,
                     model.as_deref(),
                     RequestOutcome::error("upstream_request_failed", &message),
                     started,
@@ -167,6 +169,7 @@ async fn proxy_request(
                                 &state,
                                 &request_id,
                                 account_id,
+                                selection_reason,
                                 model.as_deref(),
                                 RequestOutcome::error("upstream_retry_failed", &message),
                                 started,
@@ -191,6 +194,7 @@ async fn proxy_request(
                         &state,
                         &request_id,
                         account_id,
+                        selection_reason,
                         model.as_deref(),
                         RequestOutcome::error("auth_refresh_failed", &message),
                         started,
@@ -216,6 +220,7 @@ async fn proxy_request(
                 &state,
                 &request_id,
                 account_id,
+                selection_reason,
                 model.as_deref(),
                 RequestOutcome::error("auth_failed", &message),
                 started,
@@ -242,6 +247,7 @@ async fn proxy_request(
                 &state,
                 &request_id,
                 account_id,
+                selection_reason,
                 model.as_deref(),
                 RequestOutcome::error("rate_limited", &message),
                 started,
@@ -266,6 +272,7 @@ async fn proxy_request(
                 &state,
                 &request_id,
                 account_id,
+                selection_reason,
                 model.as_deref(),
                 RequestOutcome::error("upstream_server_error", &message),
                 started,
@@ -285,6 +292,7 @@ async fn proxy_request(
                 &state,
                 &request_id,
                 account_id,
+                selection_reason,
                 model.as_deref(),
                 RequestOutcome::error("upstream_error", &message),
                 started,
@@ -303,10 +311,13 @@ async fn proxy_request(
             state,
             response,
             lease,
-            request_id,
-            model,
-            started,
-            event_stream,
+            StreamLogContext {
+                request_id,
+                model,
+                selection_reason,
+                started,
+                event_stream,
+            },
         );
         return build_response(status, response_headers, Body::from_stream(stream));
     }
@@ -347,14 +358,19 @@ fn proxy_attempts(active_count: i64, max_attempts: usize) -> usize {
     }
 }
 
+struct StreamLogContext {
+    request_id: String,
+    model: Option<String>,
+    selection_reason: SelectionReason,
+    started: Instant,
+    event_stream: bool,
+}
+
 fn logged_response_stream(
     state: AppState,
     response: reqwest::Response,
     lease: AccountLease,
-    request_id: String,
-    model: Option<String>,
-    started: Instant,
-    event_stream: bool,
+    context: StreamLogContext,
 ) -> impl futures_util::Stream<Item = Result<Bytes, io::Error>> {
     async_stream::try_stream! {
         let mut upstream = response.bytes_stream();
@@ -384,16 +400,17 @@ fn logged_response_stream(
                         };
                         log_request(
                             &state,
-                            &request_id,
+                            &context.request_id,
                             account_id,
-                            model.as_deref(),
+                            context.selection_reason,
+                            context.model.as_deref(),
                             RequestOutcome {
                                 status,
                                 error_code,
                                 error_message: None,
                                 usage,
                             },
-                            started,
+                            context.started,
                         ).await;
                         if let Some(lease) = lease.take() {
                             lease.release();
@@ -410,7 +427,7 @@ fn logged_response_stream(
         }
 
         if !settled {
-            let (usage, response_id) = capture_metadata(&capture, event_stream);
+            let (usage, response_id) = capture_metadata(&capture, context.event_stream);
             if let Some(response_id) = response_id {
                 bind_response_affinity(&state, account_id, &response_id).await;
             }
@@ -421,16 +438,17 @@ fn logged_response_stream(
             };
             log_request(
                 &state,
-                &request_id,
+                &context.request_id,
                 account_id,
-                model.as_deref(),
+                context.selection_reason,
+                context.model.as_deref(),
                 RequestOutcome {
                     status,
                     error_code,
                     error_message,
                     usage,
                 },
-                started,
+                context.started,
             ).await;
             if let Some(lease) = lease.take() {
                 lease.release();
@@ -487,6 +505,7 @@ async fn log_request(
     state: &AppState,
     request_id: &str,
     account_id: Uuid,
+    selection_reason: SelectionReason,
     model: Option<&str>,
     outcome: RequestOutcome<'_>,
     started: Instant,
@@ -498,6 +517,7 @@ async fn log_request(
             account_id: Some(account_id),
             model,
             status: outcome.status,
+            selection_reason: Some(selection_reason),
             error_code: outcome.error_code,
             error_message: outcome.error_message,
             usage: outcome.usage,

@@ -26,7 +26,7 @@ use uuid::Uuid;
 use crate::{
     db,
     error::{AppError, AppResult},
-    models::{NewRequestLog, SelectedAccount, UsageData},
+    models::{NewRequestLog, SelectedAccount, SelectionReason, UsageData},
     proxy,
     state::AppState,
     upstream,
@@ -47,13 +47,23 @@ pub async fn proxy_responses(
     let affinity = websocket_affinity(&headers);
     let prepared = select_and_connect(&state, &headers, affinity.as_ref()).await?;
     let account_id = prepared.selected.account.id;
+    let selection_reason = prepared.selected.selection_reason;
     let upstream_headers = prepared.response_headers;
     let upstream_socket = prepared.socket;
 
     let mut response = upgrade
         .max_message_size(MAX_MESSAGE_SIZE)
         .max_frame_size(MAX_MESSAGE_SIZE)
-        .on_upgrade(move |client| bridge(state, client, upstream_socket, account_id, affinity));
+        .on_upgrade(move |client| {
+            bridge(
+                state,
+                client,
+                upstream_socket,
+                account_id,
+                affinity,
+                selection_reason,
+            )
+        });
     copy_upstream_handshake_headers(&upstream_headers, response.headers_mut());
     Ok(response)
 }
@@ -273,8 +283,10 @@ async fn bridge(
     mut upstream_socket: UpstreamSocket,
     account_id: Uuid,
     affinity: Option<AffinityKey>,
+    selection_reason: SelectionReason,
 ) {
     let mut active_turn: Option<ActiveTurn> = None;
+    let mut next_selection_reason = Some(selection_reason);
     let mut shutdown = state.subscribe_shutdown();
     let mut service_restart = false;
     let idle_timeout = state.config.request_timeout;
@@ -333,7 +345,10 @@ async fn bridge(
                             "a new WebSocket request started before the previous request completed",
                         ).await;
                     }
-                    match start_turn(&state, account_id, request).await {
+                    let selection_reason = next_selection_reason
+                        .take()
+                        .unwrap_or(SelectionReason::WebsocketReuse);
+                    match start_turn(&state, account_id, request, selection_reason).await {
                         Ok(turn) => {
                             if let Some(affinity) = affinity.as_ref()
                                 && let Err(error) = db::bind_affinity(
@@ -417,6 +432,18 @@ async fn bridge(
         }
     };
 
+    if service_restart {
+        // Signal reconnect before any SQLite accounting. A contended write can
+        // wait for the busy timeout, which is longer than systemd's stop budget.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.send(ClientMessage::Close(Some(ClientCloseFrame {
+                code: 1012,
+                reason: "service restart".into(),
+            }))),
+        )
+        .await;
+    }
     if let Some(turn) = active_turn {
         let error_code = if service_restart {
             "service_restart"
@@ -426,14 +453,6 @@ async fn bridge(
         finish_disconnected_turn(&state, account_id, turn, error_code, disconnect_message).await;
     }
     if service_restart {
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            client.send(ClientMessage::Close(Some(ClientCloseFrame {
-                code: 1012,
-                reason: "service restart".into(),
-            }))),
-        )
-        .await;
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(1),
             upstream_socket.close(None),
@@ -475,6 +494,7 @@ fn parse_response_create(text: &str) -> Option<ParsedRequest> {
 struct ActiveTurn {
     request_id: String,
     model: Option<String>,
+    selection_reason: SelectionReason,
     started: Instant,
     lease: AccountLease,
 }
@@ -483,6 +503,7 @@ async fn start_turn(
     state: &AppState,
     account_id: Uuid,
     request: ParsedRequest,
+    selection_reason: SelectionReason,
 ) -> AppResult<ActiveTurn> {
     if !db::acquire_account_if_available(&state.pool, account_id).await? {
         return Err(AppError::Unavailable(
@@ -492,6 +513,7 @@ async fn start_turn(
     Ok(ActiveTurn {
         request_id: request.request_id,
         model: request.model,
+        selection_reason,
         started: Instant::now(),
         lease: AccountLease::new(state.pool.clone(), account_id),
     })
@@ -612,6 +634,7 @@ async fn persist_turn(
             account_id: Some(account_id),
             model: turn.model.as_deref(),
             status,
+            selection_reason: Some(turn.selection_reason),
             error_code,
             error_message,
             usage,
