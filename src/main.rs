@@ -63,6 +63,7 @@ async fn serve(config: Config) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let state = AppState::new(config, pool, crypto);
     let _scheduler = scheduler::spawn(state.clone());
+    let _pending_session_routes = scheduler::spawn_pending_session_routes(state.clone());
     let _cost_backfill = scheduler::spawn_api_cost_backfill(state.clone());
     let shutdown_state = state.clone();
     let app = build_app(state);

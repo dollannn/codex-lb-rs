@@ -229,9 +229,15 @@ codex-lb-rs usage refresh
 codex-lb-rs logs list --limit 50
 codex-lb-rs sessions list
 codex-lb-rs sessions show <codex-session-id>
+codex-lb-rs sessions rebalance <codex-session-id> [--dry-run]
+codex-lb-rs sessions reroute <codex-session-id> --to <account-label-or-id> [--dry-run]
 ```
 
-`sessions list` matches local Codex rollout UUIDs to the pool's current sticky routes and reports the last account each session was routed through. `sessions show` resolves one known UUID, while `sessions routes` shows privacy-preserving route fingerprints when the local rollout file is unavailable. Raw session IDs never enter SQLite or the admin API: the CLI hashes them locally before lookup. A route is retained for the configured sticky-session TTL, so “last routed” does not necessarily mean that the corresponding process is connected right now.
+`sessions list` groups modern rollout metadata into root trees before matching them to sticky routes, so subagents and compacted descendants do not appear as unrelated sessions. `sessions show` accepts a root or descendant UUID and shows every locally derivable matching route, while `sessions routes` shows privacy-preserving route fingerprints when local rollout metadata is unavailable.
+
+`sessions rebalance` runs the normal quota-pressure selector for one complete root tree; it can keep the current account when that account still scores best. `sessions reroute` prefers an exact account UUID or normalized label. If an existing target is unavailable, the command uses the smart selector instead of stranding the session. Both commands apply immediately unless `--dry-run` is supplied. Matching Responses WebSockets receive close code `1012` with reason `session reroute`, then Codex reconnects and replays an interrupted turn. Pending actions survive daemon restarts and are retried when an account becomes eligible.
+
+Raw session IDs never enter SQLite or the admin API: the CLI hashes root, descendant, and affinity candidates locally before lookup or mutation. Action responses contain only a short session fingerprint and account labels. Applied routes still obey the configured sticky-session TTL, so “last routed” does not necessarily mean that the corresponding process is connected right now.
 
 Runtime settings are stored in SQLite and apply without a daemon restart:
 

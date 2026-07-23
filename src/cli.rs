@@ -458,6 +458,7 @@ async fn run_sessions(cli: &Cli, command: &SessionsCommand) -> Result<()> {
                 "rootSessionId": tree.root_id,
                 "fingerprint": &root_key_hash[..12],
                 "route": route,
+                "routes": routes,
                 "semantics": "last_routed",
                 "note": "A sticky route is not proof that the session process is currently connected."
             }))

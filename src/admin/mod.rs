@@ -14,7 +14,10 @@ use crate::{
     auth_file::parse_auth_json,
     db,
     error::{AppError, AppResult},
-    models::{AccountUpdateRequest, LogsQuery, ResolveSessionRoutesRequest, SessionRoutesQuery},
+    models::{
+        AccountUpdateRequest, LogsQuery, ResolveSessionRoutesRequest, SessionRouteActionRequest,
+        SessionRouteActionStatus, SessionRoutesQuery,
+    },
     state::AppState,
     upstream,
 };
@@ -36,6 +39,7 @@ pub fn router(state: AppState) -> Router<AppState> {
             "/session-routes",
             get(session_routes).post(resolve_session_routes),
         )
+        .route("/session-routes/actions", post(apply_session_route_action))
         .route("/settings", get(settings).put(update_settings))
         .route_layer(middleware::from_fn_with_state(state, admin_auth))
 }
@@ -258,6 +262,87 @@ async fn resolve_session_routes(
     })))
 }
 
+async fn apply_session_route_action(
+    State(state): State<AppState>,
+    Json(payload): Json<SessionRouteActionRequest>,
+) -> AppResult<Json<Value>> {
+    if payload.keys.len() > 500 {
+        return Err(AppError::BadRequest(
+            "at most 500 session route keys can be used at once".to_string(),
+        ));
+    }
+    if !valid_session_route_hash(&payload.root_key_hash)
+        || payload
+            .keys
+            .iter()
+            .any(|key| !valid_session_route_hash(&key.key_hash))
+    {
+        return Err(AppError::BadRequest(
+            "session route hashes must be 64 lowercase hexadecimal characters".to_string(),
+        ));
+    }
+
+    let candidate_hashes = std::iter::once(payload.root_key_hash.clone())
+        .chain(payload.keys.iter().map(|key| key.key_hash.clone()))
+        .collect::<Vec<_>>();
+    let snapshot = state
+        .session_connections
+        .snapshot(&payload.root_key_hash, &candidate_hashes);
+    let settings = db::runtime_settings(&state.pool).await?;
+    let action = db::apply_session_route_action(
+        &state.pool,
+        &settings,
+        state.config.usage_refresh_interval,
+        payload,
+        &snapshot.account_ids,
+    )
+    .await?;
+
+    let (matching_connections, signaled_connections) = if !action.dry_run
+        && action.route_generation > 0
+        && matches!(
+            action.status,
+            SessionRouteActionStatus::Applied | SessionRouteActionStatus::Fallback
+        ) {
+        let signal = state.session_connections.signal_reroute(
+            &action.root_key_hash,
+            &candidate_hashes,
+            action.route_generation,
+        );
+        (signal.matching_connections, signal.signaled_connections)
+    } else {
+        (snapshot.connection_count, 0)
+    };
+    let pending_reconnect = signaled_connections > 0;
+
+    let mut action_value = serde_json::to_value(action).map_err(|error| {
+        AppError::Internal(format!("serializing session route action: {error}"))
+    })?;
+    let action_object = action_value.as_object_mut().ok_or_else(|| {
+        AppError::Internal("session route action did not serialize as an object".to_string())
+    })?;
+    action_object.insert(
+        "matchingConnections".to_string(),
+        matching_connections.into(),
+    );
+    action_object.insert(
+        "signaledConnections".to_string(),
+        signaled_connections.into(),
+    );
+    action_object.insert("pendingReconnect".to_string(), pending_reconnect.into());
+
+    Ok(Json(
+        serde_json::json!({ "sessionRouteAction": action_value }),
+    ))
+}
+
+fn valid_session_route_hash(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 async fn settings(State(state): State<AppState>) -> AppResult<Json<Value>> {
     let settings = db::list_settings(&state.pool).await?;
     Ok(Json(serde_json::json!({ "settings": settings })))
@@ -272,4 +357,19 @@ async fn update_settings(
     })?;
     let settings = db::upsert_settings(&state.pool, object).await?;
     Ok(Json(serde_json::json!({ "settings": settings })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_session_route_hash;
+
+    #[test]
+    fn session_route_hash_validation_requires_lowercase_sha256_shape() {
+        assert!(valid_session_route_hash(&"a".repeat(64)));
+        assert!(valid_session_route_hash(&"09".repeat(32)));
+        assert!(!valid_session_route_hash(&"A".repeat(64)));
+        assert!(!valid_session_route_hash(&"g".repeat(64)));
+        assert!(!valid_session_route_hash(&"a".repeat(63)));
+        assert!(!valid_session_route_hash(&"a".repeat(65)));
+    }
 }

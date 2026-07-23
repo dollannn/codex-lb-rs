@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use tokio::time::{Instant, MissedTickBehavior};
 
-use crate::{db, state::AppState, upstream};
+use crate::{db, models::SessionRouteActionStatus, state::AppState, upstream};
 
 pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -29,7 +29,6 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
                 Ok(_) => {}
                 Err(error) => tracing::warn!(%error, "usage refresh cycle failed"),
             }
-
             refresh_count = refresh_count.wrapping_add(1);
             if refresh_count == 1 || refresh_count.is_multiple_of(360) {
                 match db::runtime_settings(&state.pool).await {
@@ -46,6 +45,79 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
             }
         }
     })
+}
+
+pub fn spawn_pending_session_routes(state: AppState) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut shutdown = state.subscribe_shutdown();
+        let mut ticker = tokio::time::interval_at(
+            Instant::now() + Duration::from_secs(2),
+            Duration::from_secs(5),
+        );
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => return,
+                _ = ticker.tick() => apply_pending_session_route_actions(&state).await,
+            }
+        }
+    })
+}
+
+async fn apply_pending_session_route_actions(state: &AppState) {
+    let settings = match db::runtime_settings(&state.pool).await {
+        Ok(settings) => settings,
+        Err(error) => {
+            tracing::warn!(%error, "could not load settings for pending session routes");
+            return;
+        }
+    };
+    let pending = match db::list_pending_session_route_actions(&state.pool, 100).await {
+        Ok(pending) => pending,
+        Err(error) => {
+            tracing::warn!(%error, "could not load pending session routes");
+            return;
+        }
+    };
+    for request in pending {
+        let candidate_hashes = std::iter::once(request.root_key_hash.clone())
+            .chain(request.keys.iter().map(|key| key.key_hash.clone()))
+            .collect::<Vec<_>>();
+        let snapshot = state
+            .session_connections
+            .snapshot(&request.root_key_hash, &candidate_hashes);
+        let action = match db::apply_session_route_action(
+            &state.pool,
+            &settings,
+            state.config.usage_refresh_interval,
+            request,
+            &snapshot.account_ids,
+        )
+        .await
+        {
+            Ok(action) => action,
+            Err(error) => {
+                tracing::warn!(%error, "pending session route could not be applied");
+                continue;
+            }
+        };
+        if matches!(
+            action.status,
+            SessionRouteActionStatus::Applied | SessionRouteActionStatus::Fallback
+        ) {
+            let signal = state.session_connections.signal_reroute(
+                &action.root_key_hash,
+                &candidate_hashes,
+                action.route_generation,
+            );
+            tracing::info!(
+                session_fingerprint = %action.session_fingerprint,
+                status = action.status.as_str(),
+                connections = signal.signaled_connections,
+                "pending session route applied"
+            );
+        }
+    }
 }
 
 pub fn spawn_api_cost_backfill(state: AppState) -> tokio::task::JoinHandle<()> {

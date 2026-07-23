@@ -809,6 +809,538 @@ async fn sqlite_admin_and_proxy_failover_smoke() -> Result<()> {
 }
 
 #[tokio::test]
+async fn targeted_session_route_actions_reconnect_and_preserve_epoch() -> Result<()> {
+    let storage = TestStorage::new();
+    let database_url = storage.database_url();
+    let pool = db::connect(&database_url).await?;
+    db::run_migrations(&pool).await?;
+
+    let fake_upstream = FakeUpstream::start().await?;
+    let crypto = TokenCrypto::load_or_create(&storage.key_path).await?;
+    let config = test_config(
+        &database_url,
+        &fake_upstream.base_url,
+        storage.key_path.clone(),
+    );
+    let account_a = insert_account(
+        &pool,
+        &crypto,
+        "good-access",
+        "acct-route-a",
+        "route-a@example.com",
+    )
+    .await?;
+    let account_b = insert_account(
+        &pool,
+        &crypto,
+        "good-access",
+        "acct-route-b",
+        "route-b@example.com",
+    )
+    .await?;
+    db::update_account(
+        &pool,
+        account_a,
+        None,
+        Some("route-a".to_string()),
+        None,
+        None,
+    )
+    .await?;
+    db::update_account(
+        &pool,
+        account_b,
+        None,
+        Some("route-b".to_string()),
+        None,
+        None,
+    )
+    .await?;
+
+    let root_session = "targeted-route-root-private";
+    let child_session = "targeted-route-child-private";
+    let root_hash = db::affinity_hash("session_id", root_session);
+    let child_hash = db::affinity_hash("session_id", child_session);
+    let route_keys = vec![
+        codex_lb_rs::models::SessionRouteKey {
+            key_hash: root_hash.clone(),
+            kind: "session_id".to_string(),
+        },
+        codex_lb_rs::models::SessionRouteKey {
+            key_hash: child_hash.clone(),
+            kind: "session_id".to_string(),
+        },
+    ];
+    db::bind_affinity(&pool, &root_hash, "session_id", account_a).await?;
+    db::bind_affinity(&pool, &child_hash, "session_id", account_a).await?;
+    db::update_account(
+        &pool,
+        account_b,
+        Some("paused".to_string()),
+        None,
+        None,
+        None,
+    )
+    .await?;
+
+    let state = AppState::new(config, pool.clone(), crypto);
+    let app_server = TestServer::start(build_app(state.clone())).await?;
+    let client = reqwest::Client::new();
+    let action_url = format!("{}/admin/session-routes/actions", app_server.base_url);
+    let rebalance_request = json!({
+        "action": "rebalance",
+        "rootKeyHash": root_hash,
+        "keys": [
+            {"keyHash": root_hash, "kind": "session_id"},
+            {"keyHash": child_hash, "kind": "session_id"}
+        ],
+        "target": null
+    });
+
+    let affinity_before = sqlx::query_as::<_, (String, Uuid, i64)>(
+        "SELECT key_hash, account_id, route_generation FROM affinity WHERE key_hash IN ($1, $2) ORDER BY key_hash",
+    )
+    .bind(&root_hash)
+    .bind(&child_hash)
+    .fetch_all(&pool)
+    .await?;
+    let roots_before = sqlx::query_as::<_, (String, i64, Option<String>)>(
+        "SELECT root_key_hash, route_generation, last_action FROM session_roots ORDER BY root_key_hash",
+    )
+    .fetch_all(&pool)
+    .await?;
+    let mappings_before = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT key_hash, root_key_hash, kind FROM session_route_keys ORDER BY key_hash",
+    )
+    .fetch_all(&pool)
+    .await?;
+    let runtime_before = sqlx::query_as::<_, (Uuid, Option<String>, i64)>(
+        "SELECT account_id, last_selected_at, inflight_count FROM account_runtime_state ORDER BY account_id",
+    )
+    .fetch_all(&pool)
+    .await?;
+
+    let mut dry_run_request = rebalance_request.clone();
+    dry_run_request["dryRun"] = json!(true);
+    let dry_run_response = client
+        .post(&action_url)
+        .bearer_auth(ADMIN_TOKEN)
+        .json(&dry_run_request)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+    assert_eq!(dry_run_response["sessionRouteAction"]["dryRun"], true);
+    assert_eq!(
+        dry_run_response["sessionRouteAction"]["signaledConnections"],
+        0
+    );
+    let affinity_after = sqlx::query_as::<_, (String, Uuid, i64)>(
+        "SELECT key_hash, account_id, route_generation FROM affinity WHERE key_hash IN ($1, $2) ORDER BY key_hash",
+    )
+    .bind(&root_hash)
+    .bind(&child_hash)
+    .fetch_all(&pool)
+    .await?;
+    let roots_after = sqlx::query_as::<_, (String, i64, Option<String>)>(
+        "SELECT root_key_hash, route_generation, last_action FROM session_roots ORDER BY root_key_hash",
+    )
+    .fetch_all(&pool)
+    .await?;
+    let mappings_after = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT key_hash, root_key_hash, kind FROM session_route_keys ORDER BY key_hash",
+    )
+    .fetch_all(&pool)
+    .await?;
+    let runtime_after = sqlx::query_as::<_, (Uuid, Option<String>, i64)>(
+        "SELECT account_id, last_selected_at, inflight_count FROM account_runtime_state ORDER BY account_id",
+    )
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(affinity_after, affinity_before);
+    assert_eq!(roots_after, roots_before);
+    assert_eq!(mappings_after, mappings_before);
+    assert_eq!(runtime_after, runtime_before);
+
+    let merge_response = client
+        .post(&action_url)
+        .bearer_auth(ADMIN_TOKEN)
+        .json(&rebalance_request)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+    assert_eq!(merge_response["sessionRouteAction"]["status"], "applied");
+    let no_op_response = client
+        .post(&action_url)
+        .bearer_auth(ADMIN_TOKEN)
+        .json(&rebalance_request)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+    assert_eq!(no_op_response["sessionRouteAction"]["status"], "no_op");
+    assert_eq!(
+        no_op_response["sessionRouteAction"]["effectiveAccount"],
+        "route-a"
+    );
+
+    let unknown_target = client
+        .post(&action_url)
+        .bearer_auth(ADMIN_TOKEN)
+        .json(&json!({
+            "action": "reroute",
+            "rootKeyHash": root_hash,
+            "keys": [
+                {"keyHash": root_hash, "kind": "session_id"},
+                {"keyHash": child_hash, "kind": "session_id"}
+            ],
+            "target": "missing-route-account"
+        }))
+        .send()
+        .await?;
+    assert_eq!(unknown_target.status(), StatusCode::NOT_FOUND);
+
+    db::update_account(
+        &pool,
+        account_b,
+        Some("active".to_string()),
+        None,
+        None,
+        None,
+    )
+    .await?;
+    // Recreate a historical split-brain route after the root merge. A targeted
+    // action must rewrite both aliases, regardless of their previous accounts.
+    sqlx::query(
+        "UPDATE affinity SET account_id = $2, last_used_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE key_hash = $1",
+    )
+    .bind(&child_hash)
+    .bind(account_b)
+    .execute(&pool)
+    .await?;
+    let old_epoch = db::resolve_session_route_epoch(&pool, &route_keys)
+        .await?
+        .expect("merged route epoch");
+
+    let mut root_request = proxy_websocket_request(&app_server.base_url)?;
+    root_request
+        .headers_mut()
+        .insert("session-id", header::HeaderValue::from_str(root_session)?);
+    let (mut root_socket, root_upgrade) = connect_async(root_request).await?;
+    assert_eq!(root_upgrade.status(), StatusCode::SWITCHING_PROTOCOLS);
+
+    let mut child_request = proxy_websocket_request(&app_server.base_url)?;
+    child_request
+        .headers_mut()
+        .insert("session-id", header::HeaderValue::from_str(child_session)?);
+    let (mut child_socket, child_upgrade) = connect_async(child_request).await?;
+    assert_eq!(child_upgrade.status(), StatusCode::SWITCHING_PROTOCOLS);
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if state
+                .session_connections
+                .snapshot(&root_hash, [&root_hash, &child_hash])
+                .connection_count
+                == 2
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+
+    let rerouted_turn_id = "integration-ws-reroute-active";
+    root_socket
+        .send(ClientWebSocketMessage::Text(
+            json!({
+                "type": "response.create",
+                "model": "gpt-ws-test",
+                "stream": true,
+                "input": [],
+                "client_metadata": {"turn_id": rerouted_turn_id}
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+    wait_for_websocket_event(&mut root_socket, "response.created").await?;
+
+    let conflicting_routes = sqlx::query_as::<_, (String, Uuid, String)>(
+        "SELECT key_hash, account_id, kind FROM affinity WHERE key_hash IN ($1, $2) ORDER BY key_hash",
+    )
+    .bind(&root_hash)
+    .bind(&child_hash)
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(conflicting_routes.len(), 2);
+    assert_eq!(
+        conflicting_routes
+            .iter()
+            .map(|(_, account_id, _)| *account_id)
+            .collect::<HashSet<_>>(),
+        HashSet::from([account_a, account_b])
+    );
+    assert!(
+        conflicting_routes
+            .iter()
+            .all(|(_, _, kind)| kind == "session_id")
+    );
+
+    let reroute_response = client
+        .post(&action_url)
+        .bearer_auth(ADMIN_TOKEN)
+        .json(&json!({
+            "action": "reroute",
+            "rootKeyHash": root_hash,
+            "keys": [
+                {"keyHash": root_hash, "kind": "session_id"},
+                {"keyHash": child_hash, "kind": "session_id"}
+            ],
+            "target": account_b.to_string()
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+    let reroute_action = &reroute_response["sessionRouteAction"];
+    assert_eq!(reroute_action["status"], "applied");
+    assert_eq!(reroute_action["requestedAccount"], "route-b");
+    assert_eq!(reroute_action["effectiveAccount"], "route-b");
+    assert_eq!(reroute_action["matchingConnections"], 2);
+    assert_eq!(reroute_action["signaledConnections"], 2);
+    assert_eq!(reroute_action["pendingReconnect"], true);
+    assert_eq!(reroute_action["changedRouteCount"], 1);
+    let rendered_action = reroute_response.to_string();
+    let account_a_id = account_a.to_string();
+    let account_b_id = account_b.to_string();
+    for private_value in [
+        root_session,
+        child_session,
+        root_hash.as_str(),
+        child_hash.as_str(),
+        account_a_id.as_str(),
+        account_b_id.as_str(),
+    ] {
+        assert!(
+            !rendered_action.contains(private_value),
+            "action response leaked private routing value"
+        );
+    }
+
+    let root_close = wait_for_websocket_close(&mut root_socket).await?;
+    let child_close = wait_for_websocket_close(&mut child_socket).await?;
+    assert_eq!(root_close, (1012, "session reroute".to_string()));
+    assert_eq!(child_close, (1012, "session reroute".to_string()));
+
+    let stale_bind =
+        db::bind_affinities_at_epoch(&pool, &route_keys, account_a, Some(&old_epoch)).await?;
+    assert!(
+        !stale_bind,
+        "an obsolete socket must not restore its account"
+    );
+    let routed_accounts = sqlx::query_scalar::<_, Uuid>(
+        "SELECT account_id FROM affinity WHERE key_hash IN ($1, $2) ORDER BY key_hash",
+    )
+    .bind(&root_hash)
+    .bind(&child_hash)
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(routed_accounts, vec![account_b, account_b]);
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let interrupted = db::list_request_logs(
+                &pool,
+                LogsQuery {
+                    limit: Some(20),
+                    offset: None,
+                },
+            )
+            .await
+            .expect("reroute logs");
+            if interrupted.iter().any(|log| {
+                log.request_id == rerouted_turn_id
+                    && log.error_code.as_deref() == Some("session_reroute")
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+
+    let mut replay_request = proxy_websocket_request(&app_server.base_url)?;
+    replay_request
+        .headers_mut()
+        .insert("session-id", header::HeaderValue::from_str(root_session)?);
+    let (mut replay_socket, replay_upgrade) = connect_async(replay_request).await?;
+    assert_eq!(replay_upgrade.status(), StatusCode::SWITCHING_PROTOCOLS);
+    replay_socket
+        .send(ClientWebSocketMessage::Text(
+            json!({
+                "type": "response.create",
+                "model": "gpt-ws-test",
+                "stream": true,
+                "input": [],
+                "client_metadata": {"turn_id": rerouted_turn_id}
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+    wait_for_websocket_event(&mut replay_socket, "response.completed").await?;
+    replay_socket.close(None).await?;
+
+    let attempts = db::list_request_logs(
+        &pool,
+        LogsQuery {
+            limit: Some(20),
+            offset: None,
+        },
+    )
+    .await?
+    .into_iter()
+    .filter(|log| log.request_id == rerouted_turn_id)
+    .collect::<Vec<_>>();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(
+        attempts
+            .iter()
+            .filter(|log| log.error_code.as_deref() == Some("session_reroute"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        attempts
+            .iter()
+            .find(|log| log.error_code.as_deref() == Some("session_reroute"))
+            .and_then(|log| log.account_id),
+        Some(account_a)
+    );
+    assert_eq!(
+        attempts
+            .iter()
+            .find(|log| log.status == "success")
+            .and_then(|log| log.account_id),
+        Some(account_b)
+    );
+
+    db::update_account(
+        &pool,
+        account_a,
+        Some("paused".to_string()),
+        None,
+        None,
+        None,
+    )
+    .await?;
+    let fallback_response = client
+        .post(&action_url)
+        .bearer_auth(ADMIN_TOKEN)
+        .json(&json!({
+            "action": "reroute",
+            "rootKeyHash": root_hash,
+            "keys": [
+                {"keyHash": root_hash, "kind": "session_id"},
+                {"keyHash": child_hash, "kind": "session_id"}
+            ],
+            "target": "route-a"
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+    assert_eq!(
+        fallback_response["sessionRouteAction"]["status"],
+        "fallback"
+    );
+    assert_eq!(
+        fallback_response["sessionRouteAction"]["requestedAccount"],
+        "route-a"
+    );
+    assert_eq!(
+        fallback_response["sessionRouteAction"]["effectiveAccount"],
+        "route-b"
+    );
+
+    db::update_account(
+        &pool,
+        account_b,
+        Some("paused".to_string()),
+        None,
+        None,
+        None,
+    )
+    .await?;
+    let pending_response = client
+        .post(&action_url)
+        .bearer_auth(ADMIN_TOKEN)
+        .json(&json!({
+            "action": "reroute",
+            "rootKeyHash": root_hash,
+            "keys": [
+                {"keyHash": root_hash, "kind": "session_id"},
+                {"keyHash": child_hash, "kind": "session_id"}
+            ],
+            "target": "route-a"
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+    assert_eq!(pending_response["sessionRouteAction"]["status"], "pending");
+    assert_eq!(
+        pending_response["sessionRouteAction"]["effectiveAccount"],
+        Value::Null
+    );
+
+    let mut pending = db::list_pending_session_route_actions(&pool, 100).await?;
+    assert_eq!(pending.len(), 1);
+    let reconstructed = pending.pop().expect("durable pending action");
+    assert_eq!(reconstructed.root_key_hash, root_hash);
+    assert_eq!(reconstructed.target.as_deref(), Some(account_a_id.as_str()));
+    db::update_account(
+        &pool,
+        account_b,
+        Some("active".to_string()),
+        None,
+        None,
+        None,
+    )
+    .await?;
+    let retry = db::apply_session_route_action(
+        &pool,
+        &db::runtime_settings(&pool).await?,
+        state.config.usage_refresh_interval,
+        reconstructed,
+        &HashSet::new(),
+    )
+    .await?;
+    assert_eq!(retry.status.as_str(), "fallback");
+    assert_eq!(retry.effective_account.as_deref(), Some("route-b"));
+    assert!(
+        db::list_pending_session_route_actions(&pool, 100)
+            .await?
+            .is_empty()
+    );
+
+    state.signal_shutdown();
+    drop(app_server);
+    drop(state);
+    pool.close().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn migration_backfills_historical_cost_as_cache_write_range() -> Result<()> {
     let storage = TestStorage::new();
     let database_url = storage.database_url();
@@ -1629,11 +2161,12 @@ async fn fake_responses_websocket(
             {
                 break;
             }
-            if request
-                .pointer("/client_metadata/turn_id")
-                .and_then(Value::as_str)
-                == Some("integration-ws-restart-active")
-                && !state.restart_turn_held.swap(true, Ordering::SeqCst)
+            if matches!(
+                request
+                    .pointer("/client_metadata/turn_id")
+                    .and_then(Value::as_str),
+                Some("integration-ws-restart-active" | "integration-ws-reroute-active")
+            ) && !state.restart_turn_held.swap(true, Ordering::SeqCst)
             {
                 while let Some(message) = socket.recv().await {
                     if matches!(message, Ok(AxumWebSocketMessage::Close(_)) | Err(_)) {
@@ -1679,6 +2212,37 @@ fn proxy_websocket_request(
         header::HeaderValue::from_static("responses_websockets=2026-02-06"),
     );
     Ok(request)
+}
+
+type TestWebSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn wait_for_websocket_event(socket: &mut TestWebSocket, event_type: &str) -> Result<Value> {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(message) = socket.next().await {
+            if let ClientWebSocketMessage::Text(text) = message? {
+                let event: Value = serde_json::from_str(text.as_str())?;
+                if event.get("type").and_then(Value::as_str) == Some(event_type) {
+                    return Ok::<_, anyhow::Error>(event);
+                }
+            }
+        }
+        anyhow::bail!("WebSocket ended before {event_type}")
+    })
+    .await?
+}
+
+async fn wait_for_websocket_close(socket: &mut TestWebSocket) -> Result<(u16, String)> {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(message) = socket.next().await {
+            if let ClientWebSocketMessage::Close(frame) = message? {
+                let frame = frame.ok_or_else(|| anyhow::anyhow!("missing close frame"))?;
+                return Ok::<_, anyhow::Error>((u16::from(frame.code), frame.reason.to_string()));
+            }
+        }
+        anyhow::bail!("WebSocket ended without a close frame")
+    })
+    .await?
 }
 
 async fn fake_compact(headers: HeaderMap) -> Response {
