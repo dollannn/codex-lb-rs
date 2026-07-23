@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     env, fs,
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
     time::SystemTime,
@@ -155,6 +156,20 @@ pub enum SessionsCommand {
     Routes {
         #[arg(long, default_value_t = 100)]
         limit: i64,
+    },
+    /// Release a session tree's sticky routes so the normal router chooses again.
+    Rebalance {
+        session_id: Uuid,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Route a session tree to one account label or UUID.
+    Reroute {
+        session_id: Uuid,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -419,16 +434,29 @@ async fn run_sessions(cli: &Cli, command: &SessionsCommand) -> Result<()> {
             .await
         }
         SessionsCommand::Show { session_id } => {
-            let key_hash = crate::db::affinity_hash("session_id", &session_id.to_string());
-            let response = resolve_session_hashes(cli, std::slice::from_ref(&key_hash)).await?;
-            let route = response
+            let catalog = discover_codex_session_catalog()?;
+            let tree = catalog.tree_for(*session_id)?;
+            let root_key_hash = root_session_key_hash(tree.root_id);
+            let aliases = session_tree_aliases(&tree)?;
+            let key_hashes = aliases
+                .iter()
+                .map(|alias| alias.key_hash.clone())
+                .collect::<Vec<_>>();
+            let response = resolve_session_hashes(cli, &key_hashes).await?;
+            let routes = response
                 .get("sessionRoutes")
                 .and_then(Value::as_array)
-                .and_then(|routes| routes.first())
+                .cloned()
+                .unwrap_or_default();
+            let route = routes
+                .iter()
+                .find(|route| route.get("keyHash").and_then(Value::as_str) == Some(&root_key_hash))
+                .or_else(|| routes.first())
                 .cloned();
             print_json(&serde_json::json!({
                 "sessionId": session_id,
-                "fingerprint": &key_hash[..12],
+                "rootSessionId": tree.root_id,
+                "fingerprint": &root_key_hash[..12],
                 "route": route,
                 "semantics": "last_routed",
                 "note": "A sticky route is not proof that the session process is currently connected."
@@ -436,15 +464,11 @@ async fn run_sessions(cli: &Cli, command: &SessionsCommand) -> Result<()> {
         }
         SessionsCommand::List { limit } => {
             let limit = (*limit).clamp(1, 500);
-            let session_ids = discover_codex_session_ids(500)?;
-            let by_hash = session_ids
-                .iter()
-                .map(|session_id| {
-                    (
-                        crate::db::affinity_hash("session_id", &session_id.to_string()),
-                        *session_id,
-                    )
-                })
+            let catalog = discover_codex_session_catalog()?;
+            // Group the complete rollout graph before imposing the API's 500-key cap.
+            let trees = catalog.session_trees().into_iter().take(500);
+            let by_hash = trees
+                .map(|tree| (root_session_key_hash(tree.root_id), tree.root_id))
                 .collect::<HashMap<_, _>>();
             let key_hashes = by_hash.keys().cloned().collect::<Vec<_>>();
             let response = resolve_session_hashes(cli, &key_hashes).await?;
@@ -472,6 +496,41 @@ async fn run_sessions(cli: &Cli, command: &SessionsCommand) -> Result<()> {
                 "note": "Raw session IDs are matched locally; the daemon stores and receives only SHA-256 hashes. A sticky route is not proof that the session process is currently connected."
             }))
         }
+        SessionsCommand::Rebalance {
+            session_id,
+            dry_run,
+        } => {
+            let catalog = discover_codex_session_catalog()?;
+            let tree = catalog.mutation_tree_for(*session_id)?;
+            let payload = session_action_payload(&tree, "rebalance", None, *dry_run)?;
+            print_response(
+                cli,
+                Method::POST,
+                "/admin/session-routes/actions",
+                Some(payload),
+            )
+            .await
+        }
+        SessionsCommand::Reroute {
+            session_id,
+            to,
+            dry_run,
+        } => {
+            let target = to.trim();
+            if target.is_empty() {
+                bail!("--to must be a non-empty account label or UUID");
+            }
+            let catalog = discover_codex_session_catalog()?;
+            let tree = catalog.mutation_tree_for(*session_id)?;
+            let payload = session_action_payload(&tree, "reroute", Some(target), *dry_run)?;
+            print_response(
+                cli,
+                Method::POST,
+                "/admin/session-routes/actions",
+                Some(payload),
+            )
+            .await
+        }
     }
 }
 
@@ -485,44 +544,434 @@ async fn resolve_session_hashes(cli: &Cli, key_hashes: &[String]) -> Result<Valu
     .await
 }
 
-fn discover_codex_session_ids(limit: usize) -> Result<Vec<Uuid>> {
-    let codex_home = env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
-        .context("neither CODEX_HOME nor HOME is set")?;
-    let root = codex_home.join("sessions");
-    if !root.exists() {
-        return Ok(Vec::new());
+const SESSION_META_SCAN_LINE_LIMIT: usize = 64;
+const SESSION_META_SCAN_BYTE_LIMIT: usize = 1024 * 1024;
+const MAX_SESSION_ACTION_KEYS: usize = 500;
+const SESSION_ALIAS_KINDS: [&str; 4] = [
+    "session_id",
+    "thread_id",
+    "conversation_id",
+    "prompt_cache_key",
+];
+
+#[derive(Debug, Clone)]
+struct RolloutNode {
+    id: Uuid,
+    session_id: Option<Uuid>,
+    parent_thread_id: Option<Uuid>,
+    forked_from_id: Option<Uuid>,
+    modified: SystemTime,
+}
+
+impl RolloutNode {
+    fn has_same_links(&self, other: &Self) -> bool {
+        self.session_id == other.session_id
+            && self.parent_thread_id == other.parent_thread_id
+            && self.forked_from_id == other.forked_from_id
     }
 
-    let mut directories = vec![root];
-    let mut discovered = Vec::new();
-    while let Some(directory) = directories.pop() {
-        for entry in fs::read_dir(&directory)
-            .with_context(|| format!("reading Codex session directory {}", directory.display()))?
-        {
-            let entry = entry?;
-            let file_type = entry.file_type()?;
-            if file_type.is_dir() {
-                directories.push(entry.path());
-            } else if file_type.is_file()
-                && let Some(session_id) = session_id_from_rollout_path(&entry.path())
+    fn parent_id(&self) -> Option<Uuid> {
+        self.parent_thread_id.or(self.forked_from_id)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SessionTree {
+    root_id: Uuid,
+    member_ids: Vec<Uuid>,
+    modified: SystemTime,
+}
+
+#[derive(Debug, Default)]
+struct SessionCatalog {
+    nodes: HashMap<Uuid, RolloutNode>,
+    issues: HashMap<Uuid, String>,
+}
+
+impl SessionCatalog {
+    fn discover(root: &Path) -> Result<Self> {
+        if !root.exists() {
+            return Ok(Self::default());
+        }
+
+        let mut catalog = Self::default();
+        let mut directories = vec![root.to_path_buf()];
+        while let Some(directory) = directories.pop() {
+            for entry in fs::read_dir(&directory)
+                .with_context(|| format!("reading Codex directory {}", directory.display()))?
             {
+                let entry = entry?;
+                let file_type = entry.file_type()?;
+                if file_type.is_dir() {
+                    directories.push(entry.path());
+                    continue;
+                }
+                if !file_type.is_file()
+                    || entry
+                        .path()
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        != Some("jsonl")
+                {
+                    continue;
+                }
+
+                let path = entry.path();
+                let filename_id = session_id_from_rollout_path(&path);
                 let modified = entry
                     .metadata()
                     .and_then(|metadata| metadata.modified())
                     .unwrap_or(SystemTime::UNIX_EPOCH);
-                discovered.push((modified, session_id));
+                match first_session_meta(&path)? {
+                    Some(meta) => match rollout_node_from_meta(&meta, modified) {
+                        Ok(node) => {
+                            if let Some(filename_id) = filename_id
+                                && filename_id != node.id
+                            {
+                                let message = format!(
+                                    "session metadata ID does not match rollout filename {}",
+                                    path.display()
+                                );
+                                catalog.issues.insert(filename_id, message.clone());
+                                catalog.issues.insert(node.id, message);
+                            }
+                            if let (Some(parent), Some(forked)) =
+                                (node.parent_thread_id, node.forked_from_id)
+                                && parent != forked
+                            {
+                                catalog.issues.insert(
+                                    node.id,
+                                    "session metadata has conflicting parent and fork IDs"
+                                        .to_string(),
+                                );
+                            }
+                            catalog.insert_node(node);
+                        }
+                        Err(error) => {
+                            if let Some(filename_id) = filename_id {
+                                catalog.issues.insert(
+                                    filename_id,
+                                    format!(
+                                        "invalid session metadata in {}: {error}",
+                                        path.display()
+                                    ),
+                                );
+                            }
+                        }
+                    },
+                    None => {
+                        if let Some(id) = filename_id {
+                            catalog.insert_node(RolloutNode {
+                                id,
+                                session_id: None,
+                                parent_thread_id: None,
+                                forked_from_id: None,
+                                modified,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Ok(catalog)
+    }
+
+    fn insert_node(&mut self, node: RolloutNode) {
+        if let Some(existing) = self.nodes.get_mut(&node.id) {
+            if !existing.has_same_links(&node) {
+                self.issues.insert(
+                    node.id,
+                    "conflicting session metadata exists for one rollout ID".to_string(),
+                );
+            }
+            if node.modified > existing.modified {
+                existing.modified = node.modified;
+            }
+        } else {
+            self.nodes.insert(node.id, node);
+        }
+    }
+
+    fn canonical_root(&self, id: Uuid) -> Result<Uuid> {
+        self.resolve_root(id, &mut HashSet::new())
+    }
+
+    fn resolve_root(&self, id: Uuid, visiting: &mut HashSet<Uuid>) -> Result<Uuid> {
+        if let Some(issue) = self.issues.get(&id) {
+            bail!("cannot resolve this session tree: {issue}");
+        }
+        let Some(node) = self.nodes.get(&id) else {
+            return Ok(id);
+        };
+        if !visiting.insert(id) {
+            bail!("cannot resolve this session tree because its parent graph contains a cycle");
+        }
+
+        let root = if let Some(session_id) = node.session_id {
+            let authoritative_root = if session_id == id {
+                id
+            } else if self.nodes.contains_key(&session_id) {
+                let resolved = self.resolve_root(session_id, visiting)?;
+                if resolved != session_id {
+                    bail!(
+                        "cannot resolve this session tree because its authoritative root is not a root"
+                    );
+                }
+                session_id
+            } else if let Some(issue) = self.issues.get(&session_id) {
+                bail!("cannot resolve this session tree: {issue}");
+            } else {
+                session_id
+            };
+            if let Some(parent_id) = node.parent_id() {
+                let parent_root = self.resolve_root(parent_id, visiting)?;
+                if parent_root != authoritative_root {
+                    bail!(
+                        "cannot resolve this session tree because its session_id conflicts with its parent root"
+                    );
+                }
+            }
+            authoritative_root
+        } else if let Some(parent_id) = node.parent_id() {
+            self.resolve_root(parent_id, visiting)?
+        } else {
+            id
+        };
+        visiting.remove(&id);
+        Ok(root)
+    }
+
+    fn session_trees(&self) -> Vec<SessionTree> {
+        let mut grouped = HashMap::<Uuid, (HashSet<Uuid>, SystemTime)>::new();
+        for node in self.nodes.values() {
+            let Ok(root_id) = self.canonical_root(node.id) else {
+                continue;
+            };
+            let group = grouped
+                .entry(root_id)
+                .or_insert_with(|| (HashSet::from([root_id]), SystemTime::UNIX_EPOCH));
+            group.0.insert(node.id);
+            for alias in [node.session_id, node.parent_thread_id, node.forked_from_id]
+                .into_iter()
+                .flatten()
+            {
+                if self.canonical_root(alias).ok() == Some(root_id) {
+                    group.0.insert(alias);
+                }
+            }
+            if node.modified > group.1 {
+                group.1 = node.modified;
+            }
+        }
+
+        let mut trees = grouped
+            .into_iter()
+            .map(|(root_id, (members, modified))| {
+                let mut member_ids = members.into_iter().collect::<Vec<_>>();
+                member_ids.sort_unstable();
+                SessionTree {
+                    root_id,
+                    member_ids,
+                    modified,
+                }
+            })
+            .collect::<Vec<_>>();
+        trees.sort_by(|left, right| {
+            right
+                .modified
+                .cmp(&left.modified)
+                .then_with(|| left.root_id.cmp(&right.root_id))
+        });
+        trees
+    }
+
+    fn tree_for(&self, id: Uuid) -> Result<SessionTree> {
+        let root_id = self.canonical_root(id)?;
+        Ok(self
+            .session_trees()
+            .into_iter()
+            .find(|tree| tree.root_id == root_id)
+            .unwrap_or_else(|| SessionTree {
+                root_id,
+                member_ids: vec![root_id],
+                modified: SystemTime::UNIX_EPOCH,
+            }))
+    }
+
+    fn mutation_tree_for(&self, id: Uuid) -> Result<SessionTree> {
+        let connected_ids = self.connected_ids(id);
+        for connected_id in &connected_ids {
+            if let Some(issue) = self.issues.get(connected_id) {
+                bail!(
+                    "cannot mutate session routes because the requested rollout tree has inconsistent metadata: {issue}"
+                );
+            }
+        }
+        // Validate the complete connected component so a malformed descendant cannot produce a
+        // partial action-key set, while unrelated damaged rollout history remains harmless.
+        for connected_id in connected_ids {
+            if self.nodes.contains_key(&connected_id) {
+                self.canonical_root(connected_id)?;
+            }
+        }
+        self.tree_for(id)
+    }
+
+    fn connected_ids(&self, id: Uuid) -> HashSet<Uuid> {
+        let mut connected = HashSet::from([id]);
+        loop {
+            let mut changed = false;
+            for node in self.nodes.values() {
+                let related = [
+                    Some(node.id),
+                    node.session_id,
+                    node.parent_thread_id,
+                    node.forked_from_id,
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+                if related
+                    .iter()
+                    .any(|related_id| connected.contains(related_id))
+                {
+                    for related_id in related {
+                        changed |= connected.insert(related_id);
+                    }
+                }
+            }
+            if !changed {
+                return connected;
             }
         }
     }
-    discovered.sort_by_key(|item| std::cmp::Reverse(item.0));
+}
+
+#[derive(Debug)]
+struct SessionAlias {
+    kind: &'static str,
+    key_hash: String,
+}
+
+fn discover_codex_session_catalog() -> Result<SessionCatalog> {
+    let codex_home = env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+        .context("neither CODEX_HOME nor HOME is set")?;
+    SessionCatalog::discover(&codex_home)
+}
+
+fn first_session_meta(path: &Path) -> Result<Option<Value>> {
+    let file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    let mut total_bytes = 0;
+    for _ in 0..SESSION_META_SCAN_LINE_LIMIT {
+        line.clear();
+        let read = reader
+            .read_line(&mut line)
+            .with_context(|| format!("reading {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        total_bytes += read;
+        if total_bytes > SESSION_META_SCAN_BYTE_LIMIT {
+            break;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) == Some("session_meta") {
+            return Ok(Some(value));
+        }
+    }
+    Ok(None)
+}
+
+fn rollout_node_from_meta(meta: &Value, modified: SystemTime) -> Result<RolloutNode> {
+    let payload = meta
+        .get("payload")
+        .and_then(Value::as_object)
+        .context("session_meta payload must be an object")?;
+    let id = required_uuid_field(payload.get("id"), "id")?;
+    Ok(RolloutNode {
+        id,
+        session_id: optional_uuid_field(payload.get("session_id"), "session_id")?,
+        parent_thread_id: optional_uuid_field(payload.get("parent_thread_id"), "parent_thread_id")?,
+        forked_from_id: optional_uuid_field(payload.get("forked_from_id"), "forked_from_id")?,
+        modified,
+    })
+}
+
+fn required_uuid_field(value: Option<&Value>, name: &str) -> Result<Uuid> {
+    let value = value
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .with_context(|| format!("session_meta payload.{name} must be a UUID string"))?;
+    Uuid::parse_str(value).with_context(|| format!("session_meta payload.{name} must be a UUID"))
+}
+
+fn optional_uuid_field(value: Option<&Value>, name: &str) -> Result<Option<Uuid>> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if value.trim().is_empty() => Ok(None),
+        Some(Value::String(value)) => Uuid::parse_str(value)
+            .map(Some)
+            .with_context(|| format!("session_meta payload.{name} must be a UUID")),
+        Some(_) => bail!("session_meta payload.{name} must be a UUID string"),
+    }
+}
+
+fn root_session_key_hash(root_id: Uuid) -> String {
+    crate::db::affinity_hash("session_id", &root_id.to_string())
+}
+
+fn session_tree_aliases(tree: &SessionTree) -> Result<Vec<SessionAlias>> {
+    let mut ids = tree.member_ids.clone();
+    ids.sort_unstable();
+    ids.retain(|id| *id != tree.root_id);
+    ids.insert(0, tree.root_id);
+
+    let mut aliases = Vec::new();
     let mut seen = HashSet::new();
-    Ok(discovered
+    for id in ids {
+        for kind in SESSION_ALIAS_KINDS {
+            let key_hash = crate::db::affinity_hash(kind, &id.to_string());
+            if seen.insert(key_hash.clone()) {
+                if aliases.len() == MAX_SESSION_ACTION_KEYS {
+                    bail!(
+                        "session tree requires more than {MAX_SESSION_ACTION_KEYS} route keys; refusing to operate on only part of the tree"
+                    );
+                }
+                aliases.push(SessionAlias { kind, key_hash });
+            }
+        }
+    }
+    Ok(aliases)
+}
+
+fn session_action_payload(
+    tree: &SessionTree,
+    action: &str,
+    target: Option<&str>,
+    dry_run: bool,
+) -> Result<Value> {
+    let keys = session_tree_aliases(tree)?
         .into_iter()
-        .filter_map(|(_, session_id)| seen.insert(session_id).then_some(session_id))
-        .take(limit)
-        .collect())
+        .map(|alias| {
+            serde_json::json!({
+                "kind": alias.kind,
+                "keyHash": alias.key_hash,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(serde_json::json!({
+        "action": action,
+        "rootKeyHash": root_session_key_hash(tree.root_id),
+        "keys": keys,
+        "target": target,
+        "dryRun": dry_run,
+    }))
 }
 
 fn session_id_from_rollout_path(path: &Path) -> Option<Uuid> {
@@ -589,9 +1038,74 @@ fn print_json(value: &Value) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{
+        collections::HashSet,
+        fs,
+        path::{Path, PathBuf},
+        time::SystemTime,
+    };
 
-    use super::session_id_from_rollout_path;
+    use clap::Parser;
+    use serde_json::{Value, json};
+    use uuid::Uuid;
+
+    use super::{
+        Cli, Command, MAX_SESSION_ACTION_KEYS, RolloutNode, SESSION_ALIAS_KINDS, SessionCatalog,
+        SessionTree, SessionsCommand, root_session_key_hash, session_action_payload,
+        session_id_from_rollout_path, session_tree_aliases,
+    };
+
+    struct TestCodexHome {
+        root: PathBuf,
+    }
+
+    impl TestCodexHome {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("codex-lb-cli-{}", Uuid::new_v4()));
+            fs::create_dir_all(&root).expect("create test Codex home");
+            Self { root }
+        }
+
+        fn write_rollout(&self, directory: &str, filename_id: Uuid, records: &[Value]) -> PathBuf {
+            let directory = self.root.join(directory);
+            fs::create_dir_all(&directory).expect("create rollout directory");
+            let path = directory.join(format!("rollout-test-{filename_id}.jsonl"));
+            let contents = records
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            fs::write(&path, format!("{contents}\n")).expect("write rollout");
+            path
+        }
+    }
+
+    impl Drop for TestCodexHome {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn test_uuid(value: u128) -> Uuid {
+        Uuid::from_u128(value)
+    }
+
+    fn session_meta(
+        id: Uuid,
+        session_id: Option<Uuid>,
+        parent_thread_id: Option<Uuid>,
+        forked_from_id: Option<Uuid>,
+    ) -> Value {
+        json!({
+            "type": "session_meta",
+            "payload": {
+                "id": id,
+                "session_id": session_id,
+                "parent_thread_id": parent_thread_id,
+                "forked_from_id": forked_from_id,
+            }
+        })
+    }
 
     #[test]
     fn reads_session_id_from_rollout_filename() {
@@ -609,5 +1123,335 @@ mod tests {
             )),
             None
         );
+    }
+
+    #[test]
+    fn modern_metadata_groups_a_whole_root_tree_before_limits() {
+        let home = TestCodexHome::new();
+        let root = test_uuid(1);
+        let child = test_uuid(2);
+        let grandchild = test_uuid(3);
+        let other_root = test_uuid(4);
+        home.write_rollout(
+            "sessions/2026/07/23",
+            root,
+            &[session_meta(root, Some(root), None, None)],
+        );
+        home.write_rollout(
+            "archived_sessions",
+            child,
+            &[
+                json!({"type":"ignored_before_meta"}),
+                session_meta(child, Some(root), Some(root), Some(root)),
+            ],
+        );
+        home.write_rollout(
+            "nested/agent/tree",
+            grandchild,
+            &[session_meta(
+                grandchild,
+                Some(root),
+                Some(child),
+                Some(child),
+            )],
+        );
+        home.write_rollout(
+            "sessions/2026/07/22",
+            other_root,
+            &[session_meta(other_root, Some(other_root), None, None)],
+        );
+
+        let catalog = SessionCatalog::discover(&home.root).expect("discover catalog");
+        let trees = catalog.session_trees();
+        assert_eq!(trees.len(), 2, "children must not consume list slots");
+        let tree = catalog.tree_for(grandchild).expect("resolve descendant");
+        assert_eq!(tree.root_id, root);
+        assert_eq!(
+            tree.member_ids.into_iter().collect::<HashSet<_>>(),
+            HashSet::from([root, child, grandchild])
+        );
+    }
+
+    #[test]
+    fn legacy_metadata_follows_parent_graph_and_filename_fallback() {
+        let home = TestCodexHome::new();
+        let root = test_uuid(10);
+        let child = test_uuid(11);
+        let filename_only = test_uuid(12);
+        home.write_rollout(
+            "sessions/legacy",
+            root,
+            &[session_meta(root, None, None, None)],
+        );
+        home.write_rollout(
+            "sessions/legacy",
+            child,
+            &[session_meta(child, None, Some(root), Some(root))],
+        );
+        home.write_rollout(
+            "other-history",
+            filename_only,
+            &[json!({"type":"event_msg","payload":{}})],
+        );
+
+        let catalog = SessionCatalog::discover(&home.root).expect("discover catalog");
+        assert_eq!(catalog.tree_for(child).unwrap().root_id, root);
+        assert_eq!(
+            catalog.tree_for(filename_only).unwrap().root_id,
+            filename_only
+        );
+    }
+
+    #[test]
+    fn mutation_rejects_metadata_filename_mismatch() {
+        let home = TestCodexHome::new();
+        let filename_id = test_uuid(20);
+        let metadata_id = test_uuid(21);
+        home.write_rollout(
+            "sessions/mismatch",
+            filename_id,
+            &[session_meta(metadata_id, Some(metadata_id), None, None)],
+        );
+
+        let catalog = SessionCatalog::discover(&home.root).expect("discover catalog");
+        let error = catalog
+            .mutation_tree_for(metadata_id)
+            .expect_err("mismatch must block mutation");
+        assert!(error.to_string().contains("inconsistent"));
+    }
+
+    #[test]
+    fn mutation_rejects_cycles_and_duplicate_conflicts() {
+        let cycle_home = TestCodexHome::new();
+        let first = test_uuid(30);
+        let second = test_uuid(31);
+        cycle_home.write_rollout(
+            "sessions/cycle",
+            first,
+            &[session_meta(first, None, Some(second), Some(second))],
+        );
+        cycle_home.write_rollout(
+            "sessions/cycle",
+            second,
+            &[session_meta(second, None, Some(first), Some(first))],
+        );
+        let catalog = SessionCatalog::discover(&cycle_home.root).expect("discover cycle");
+        assert!(
+            catalog
+                .mutation_tree_for(first)
+                .expect_err("cycle must fail")
+                .to_string()
+                .contains("cycle")
+        );
+
+        let conflict_home = TestCodexHome::new();
+        let duplicate = test_uuid(32);
+        let root_a = test_uuid(33);
+        let root_b = test_uuid(34);
+        conflict_home.write_rollout(
+            "sessions/a",
+            duplicate,
+            &[session_meta(duplicate, Some(root_a), None, None)],
+        );
+        conflict_home.write_rollout(
+            "sessions/b",
+            duplicate,
+            &[session_meta(duplicate, Some(root_b), None, None)],
+        );
+        let catalog = SessionCatalog::discover(&conflict_home.root).expect("discover conflict");
+        assert!(
+            catalog
+                .mutation_tree_for(duplicate)
+                .expect_err("conflict must fail")
+                .to_string()
+                .contains("inconsistent")
+        );
+    }
+
+    #[test]
+    fn mutation_validates_only_the_requested_connected_tree() {
+        let home = TestCodexHome::new();
+        let valid_root = test_uuid(40);
+        let unrelated_filename = test_uuid(41);
+        let unrelated_metadata = test_uuid(42);
+        home.write_rollout(
+            "sessions/valid",
+            valid_root,
+            &[session_meta(valid_root, Some(valid_root), None, None)],
+        );
+        home.write_rollout(
+            "sessions/unrelated-mismatch",
+            unrelated_filename,
+            &[session_meta(
+                unrelated_metadata,
+                Some(unrelated_metadata),
+                None,
+                None,
+            )],
+        );
+
+        let catalog = SessionCatalog::discover(&home.root).expect("discover catalog");
+        assert!(catalog.mutation_tree_for(valid_root).is_ok());
+        assert!(catalog.mutation_tree_for(unrelated_metadata).is_err());
+    }
+
+    #[test]
+    fn modern_session_root_must_match_the_parent_graph() {
+        let home = TestCodexHome::new();
+        let claimed_root = test_uuid(50);
+        let parent_root = test_uuid(51);
+        let child = test_uuid(52);
+        home.write_rollout(
+            "sessions/conflicting-modern-root",
+            claimed_root,
+            &[session_meta(claimed_root, Some(claimed_root), None, None)],
+        );
+        home.write_rollout(
+            "sessions/conflicting-modern-root",
+            parent_root,
+            &[session_meta(parent_root, Some(parent_root), None, None)],
+        );
+        home.write_rollout(
+            "sessions/conflicting-modern-root",
+            child,
+            &[session_meta(
+                child,
+                Some(claimed_root),
+                Some(parent_root),
+                Some(parent_root),
+            )],
+        );
+
+        let catalog = SessionCatalog::discover(&home.root).expect("discover catalog");
+        let error = catalog
+            .mutation_tree_for(child)
+            .expect_err("conflicting modern and parent roots must fail");
+        assert!(error.to_string().contains("conflicts with its parent root"));
+    }
+
+    #[test]
+    fn action_aliases_are_typed_unique_bounded_and_privacy_safe() {
+        let root = test_uuid(100);
+        let member_ids = (100..225).map(test_uuid).collect::<Vec<_>>();
+        let tree = SessionTree {
+            root_id: root,
+            member_ids: member_ids.clone(),
+            modified: SystemTime::UNIX_EPOCH,
+        };
+
+        let aliases = session_tree_aliases(&tree).expect("500 aliases fit exactly");
+        assert_eq!(aliases.len(), MAX_SESSION_ACTION_KEYS);
+        assert_eq!(aliases[0].key_hash, root_session_key_hash(root));
+        assert_eq!(
+            aliases
+                .iter()
+                .take(SESSION_ALIAS_KINDS.len())
+                .map(|alias| alias.kind)
+                .collect::<Vec<_>>(),
+            SESSION_ALIAS_KINDS
+        );
+        assert_eq!(
+            aliases
+                .iter()
+                .map(|alias| alias.key_hash.as_str())
+                .collect::<HashSet<_>>()
+                .len(),
+            aliases.len()
+        );
+
+        let payload = session_action_payload(&tree, "reroute", Some("account-a"), true)
+            .expect("build bounded payload");
+        assert_eq!(payload["action"], "reroute");
+        assert_eq!(payload["target"], "account-a");
+        assert_eq!(payload["dryRun"], true);
+        assert_eq!(
+            payload["keys"].as_array().unwrap().len(),
+            MAX_SESSION_ACTION_KEYS
+        );
+        let serialized = payload.to_string();
+        for id in member_ids {
+            assert!(!serialized.contains(&id.to_string()));
+        }
+    }
+
+    #[test]
+    fn action_aliases_reject_a_partial_tree() {
+        let root = test_uuid(400);
+        let tree = SessionTree {
+            root_id: root,
+            member_ids: (400..526).map(test_uuid).collect(),
+            modified: SystemTime::UNIX_EPOCH,
+        };
+
+        let error = session_tree_aliases(&tree).expect_err("more than 500 keys must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to operate on only part")
+        );
+        assert!(session_action_payload(&tree, "rebalance", None, false).is_err());
+    }
+
+    #[test]
+    fn parses_rebalance_and_reroute_commands() {
+        let session_id = test_uuid(200);
+        let cli = Cli::try_parse_from([
+            "codex-lb-rs",
+            "sessions",
+            "rebalance",
+            &session_id.to_string(),
+            "--dry-run",
+        ])
+        .expect("parse rebalance");
+        assert!(matches!(
+            cli.command,
+            Command::Sessions {
+                command: SessionsCommand::Rebalance {
+                    session_id: parsed,
+                    dry_run: true,
+                }
+            } if parsed == session_id
+        ));
+
+        let cli = Cli::try_parse_from([
+            "codex-lb-rs",
+            "sessions",
+            "reroute",
+            &session_id.to_string(),
+            "--to",
+            "account-b",
+        ])
+        .expect("parse reroute");
+        assert!(matches!(
+            cli.command,
+            Command::Sessions {
+                command: SessionsCommand::Reroute {
+                    session_id: parsed,
+                    to,
+                    dry_run: false,
+                }
+            } if parsed == session_id && to == "account-b"
+        ));
+    }
+
+    #[test]
+    fn duplicate_identical_metadata_merges_latest_rollout_without_conflict() {
+        let id = test_uuid(300);
+        let mut catalog = SessionCatalog::default();
+        catalog.insert_node(RolloutNode {
+            id,
+            session_id: Some(id),
+            parent_thread_id: None,
+            forked_from_id: None,
+            modified: SystemTime::UNIX_EPOCH,
+        });
+        catalog.insert_node(RolloutNode {
+            id,
+            session_id: Some(id),
+            parent_thread_id: None,
+            forked_from_id: None,
+            modified: SystemTime::now(),
+        });
+        assert!(catalog.mutation_tree_for(id).is_ok());
     }
 }
