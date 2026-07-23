@@ -128,6 +128,111 @@ pub struct SessionRoute {
     pub last_used_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionRouteActionKind {
+    Rebalance,
+    Reroute,
+}
+
+impl SessionRouteActionKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rebalance => "rebalance",
+            Self::Reroute => "reroute",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionRouteActionStatus {
+    Applied,
+    Fallback,
+    Pending,
+    NoOp,
+}
+
+impl SessionRouteActionStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::Fallback => "fallback",
+            Self::Pending => "pending",
+            Self::NoOp => "no_op",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRouteKey {
+    pub key_hash: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRouteActionRequest {
+    pub root_key_hash: String,
+    pub keys: Vec<SessionRouteKey>,
+    pub action: SessionRouteActionKind,
+    #[serde(default)]
+    pub target: Option<String>,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// Privacy-safe result for the admin API. The complete root hash is retained for
+/// in-process connection signalling, but can never be serialized into a response.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRouteActionResponse {
+    #[serde(skip_serializing)]
+    pub root_key_hash: String,
+    pub session_fingerprint: String,
+    pub action: SessionRouteActionKind,
+    pub status: SessionRouteActionStatus,
+    pub requested_account: Option<String>,
+    pub effective_account: Option<String>,
+    pub previous_accounts: Vec<String>,
+    pub route_generation: i64,
+    pub linked_route_count: usize,
+    pub changed_route_count: usize,
+    pub merged_root_count: usize,
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSessionRouteTarget {
+    pub account_id: Uuid,
+    pub account_label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SmartAccountPreview {
+    pub account_id: Uuid,
+    pub account_label: String,
+}
+
+/// Non-serializable routing epoch captured before a request selects an account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRouteContext {
+    pub root_key_hash: String,
+    pub route_generation: i64,
+    pub action: Option<SessionRouteActionKind>,
+    pub action_status: Option<SessionRouteActionStatus>,
+    pub requested_account_id: Option<Uuid>,
+    pub effective_account_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRouteEpoch {
+    pub root_key_hash: String,
+    pub route_generation: i64,
+    pub selection_key_hash: String,
+}
+
 pub struct NewRequestLog<'a> {
     pub request_id: &'a str,
     pub account_id: Option<Uuid>,
@@ -302,7 +407,10 @@ pub struct ResolveSessionRoutesRequest {
 mod tests {
     use serde_json::json;
 
-    use super::RuntimeSettings;
+    use super::{
+        RuntimeSettings, SessionRouteActionKind, SessionRouteActionResponse,
+        SessionRouteActionStatus,
+    };
 
     #[test]
     fn runtime_settings_apply_json_and_string_values() {
@@ -336,5 +444,29 @@ mod tests {
         settings.apply("rate_limit_cooldown_seconds", &json!(false));
 
         assert_eq!(settings, RuntimeSettings::default());
+    }
+
+    #[test]
+    fn session_route_action_response_never_serializes_the_root_hash() {
+        let root_hash = "a".repeat(64);
+        let response = SessionRouteActionResponse {
+            root_key_hash: root_hash.clone(),
+            session_fingerprint: root_hash[..12].to_string(),
+            action: SessionRouteActionKind::Reroute,
+            status: SessionRouteActionStatus::Applied,
+            requested_account: Some("work".to_string()),
+            effective_account: Some("work".to_string()),
+            previous_accounts: vec!["personal".to_string()],
+            route_generation: 2,
+            linked_route_count: 3,
+            changed_route_count: 3,
+            merged_root_count: 1,
+            dry_run: false,
+        };
+
+        let serialized = serde_json::to_value(response).expect("serialize action response");
+        assert_eq!(serialized["sessionFingerprint"], &root_hash[..12]);
+        assert!(serialized.get("rootKeyHash").is_none());
+        assert!(!serialized.to_string().contains(&root_hash));
     }
 }

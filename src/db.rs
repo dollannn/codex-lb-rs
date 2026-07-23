@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{
-    QueryBuilder, Sqlite, SqlitePool,
+    QueryBuilder, Sqlite, SqlitePool, Transaction,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
 };
 use uuid::Uuid;
@@ -21,7 +21,10 @@ use crate::{
     error::{AppError, AppResult},
     models::{
         Account, AccountSummary, AccountTokens, LogsQuery, NewRequestLog, RequestLog,
-        RuntimeSettings, SelectedAccount, SelectionReason, SessionRoute, SettingRow, UsageData,
+        ResolvedSessionRouteTarget, RuntimeSettings, SelectedAccount, SelectionReason,
+        SessionRoute, SessionRouteActionKind, SessionRouteActionRequest,
+        SessionRouteActionResponse, SessionRouteActionStatus, SessionRouteContext,
+        SessionRouteEpoch, SessionRouteKey, SettingRow, SmartAccountPreview, UsageData,
         UsageSample, UsageSnapshot, UsageSummary, UsageWindow,
     },
     pricing::{self, ApiCostStatus, PRICING_VERSION},
@@ -40,6 +43,22 @@ const ROUTING_INFLIGHT_PENALTY: f64 = 2.0;
 pub struct ApiCostBackfillBatch {
     pub selected: u64,
     pub updated: u64,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct SessionRouteKeyRow {
+    key_hash: String,
+    root_key_hash: String,
+    kind: String,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct AffinityRouteActionRow {
+    key_hash: String,
+    kind: String,
+    account_id: Uuid,
+    account_label: String,
+    route_generation: i64,
 }
 
 pub async fn connect(database_url: &str) -> AppResult<SqlitePool> {
@@ -401,6 +420,81 @@ pub async fn get_account(pool: &SqlitePool, id: Uuid) -> AppResult<Option<Accoun
         .map_err(AppError::Database)
 }
 
+async fn account_display_label(pool: &SqlitePool, account_id: Uuid) -> AppResult<String> {
+    sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT CASE
+            WHEN label = '' THEN 'unlabeled'
+            ELSE label
+        END
+        FROM accounts
+        WHERE id = $1
+        "#,
+    )
+    .bind(account_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| AppError::NotFound("account target no longer exists".to_string()))
+}
+
+/// Resolve an exact UUID or normalized account label without considering the
+/// account's current routing eligibility.
+pub async fn resolve_session_route_target(
+    pool: &SqlitePool,
+    target: &str,
+) -> AppResult<ResolvedSessionRouteTarget> {
+    let target = target.trim();
+    if target.is_empty() {
+        return Err(AppError::BadRequest(
+            "reroute target must not be empty".to_string(),
+        ));
+    }
+    if let Ok(account_id) = Uuid::parse_str(target) {
+        let account_label = account_display_label(pool, account_id)
+            .await
+            .map_err(|error| {
+                if matches!(error, AppError::NotFound(_)) {
+                    AppError::NotFound("account target not found".to_string())
+                } else {
+                    error
+                }
+            })?;
+        return Ok(ResolvedSessionRouteTarget {
+            account_id,
+            account_label,
+        });
+    }
+
+    let normalized = normalize_label(target)?;
+    let matches = sqlx::query_as::<_, (Uuid, String)>(
+        r#"
+        SELECT
+            id,
+            CASE
+                WHEN label = '' THEN 'unlabeled'
+                ELSE label
+            END AS account_label
+        FROM accounts
+        WHERE lower(trim(label)) = $1
+        ORDER BY created_at, id
+        LIMIT 2
+        "#,
+    )
+    .bind(normalized)
+    .fetch_all(pool)
+    .await?;
+    match matches.as_slice() {
+        [] => Err(AppError::NotFound("account target not found".to_string())),
+        [(account_id, account_label)] => Ok(ResolvedSessionRouteTarget {
+            account_id: *account_id,
+            account_label: account_label.clone(),
+        }),
+        _ => Err(AppError::BadRequest(
+            "account target label is ambiguous".to_string(),
+        )),
+    }
+}
+
 pub async fn update_account(
     pool: &SqlitePool,
     id: Uuid,
@@ -542,17 +636,72 @@ pub async fn select_account_for_request(
     }
 
     let mut tx = pool.begin().await?;
+    let usage_weighted = settings.routing_strategy != "round_robin";
+    let mut query = QueryBuilder::<Sqlite>::new("");
+    push_smart_routing_ctes(
+        &mut query,
+        &selected_at,
+        usage_refresh_interval,
+        usage_weighted,
+    );
+    query.push(
+        r#"
+        UPDATE account_runtime_state
+        SET last_selected_at = "#,
+    );
+    query.push_bind(&selected_at);
+    query.push(
+        r#",
+            cooldown_until = NULL,
+            cooldown_reason = NULL,
+            inflight_count = inflight_count + 1,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE account_id = (
+        "#,
+    );
+    push_smart_account_candidate(&mut query, usage_weighted, excluded);
+    query.push(") RETURNING account_id");
+    let account_id = query
+        .build_query_scalar::<Uuid>()
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            AppError::Unavailable(
+                "no eligible accounts are available; retry after the current cooldown".to_string(),
+            )
+        })?;
+    tx.commit().await?;
+
+    let reason = if !excluded.is_empty() {
+        SelectionReason::Failover
+    } else if usage_weighted {
+        SelectionReason::UsageWeighted
+    } else {
+        SelectionReason::RoundRobin
+    };
+    match selected_account(pool, crypto, account_id, reason).await {
+        Ok(selected) => Ok(selected),
+        Err(error) => {
+            release_account(pool, account_id).await.ok();
+            Err(error)
+        }
+    }
+}
+
+fn push_smart_routing_ctes(
+    query: &mut QueryBuilder<'_, Sqlite>,
+    selected_at: &str,
+    usage_refresh_interval: Duration,
+    usage_weighted: bool,
+) {
     let freshness_seconds = usage_refresh_interval
         .as_secs()
         .saturating_mul(ROUTING_USAGE_FRESHNESS_INTERVALS)
         .max(MIN_ROUTING_USAGE_FRESHNESS_SECONDS)
         .min(i64::MAX as u64) as i64;
-    let usage_weighted = settings.routing_strategy != "round_robin";
-    let mut query = QueryBuilder::<Sqlite>::new(
-        "WITH clock(now_jd, freshness_days, skew_days) AS (SELECT julianday(",
-    );
-    query.push_bind(&selected_at);
-    query.push(") , CAST(");
+    query.push("WITH clock(now_jd, freshness_days, skew_days) AS (SELECT julianday(");
+    query.push_bind(selected_at.to_string());
+    query.push("), CAST(");
     query.push_bind(freshness_seconds);
     query.push(" AS REAL) / 86400.0, ");
     query.push_bind(ROUTING_CLOCK_SKEW_SECONDS);
@@ -652,22 +801,18 @@ pub async fn select_account_for_request(
             )"#,
         );
     }
+}
+
+fn push_smart_account_candidate(
+    query: &mut QueryBuilder<'_, Sqlite>,
+    usage_weighted: bool,
+    excluded: &HashSet<Uuid>,
+) {
     query.push(
         r#"
-        UPDATE account_runtime_state
-        SET last_selected_at = "#,
-    );
-    query.push_bind(&selected_at);
-    query.push(
-        r#",
-            cooldown_until = NULL,
-            cooldown_reason = NULL,
-            inflight_count = inflight_count + 1,
-            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-        WHERE account_id = (
-            SELECT a.id
-            FROM accounts a
-            INNER JOIN account_runtime_state r ON r.account_id = a.id
+        SELECT a.id
+        FROM accounts a
+        INNER JOIN account_runtime_state r ON r.account_id = a.id
         "#,
     );
     if usage_weighted {
@@ -675,27 +820,27 @@ pub async fn select_account_for_request(
     }
     query.push(
         r#"
-            CROSS JOIN clock
-            WHERE a.status = 'active'
-              AND (r.cooldown_until IS NULL OR julianday(r.cooldown_until) <= clock.now_jd)
-              AND NOT EXISTS (
-                  SELECT 1 FROM usage_windows exhausted
-                  WHERE exhausted.account_id = a.id
-                    AND exhausted.quota_key = 'codex'
-                    AND exhausted.used_percent >= 100
-                    AND (
-                        exhausted.reset_at IS NULL
-                        OR julianday(exhausted.reset_at) IS NULL
-                        OR julianday(exhausted.reset_at) > clock.now_jd
-                    )
-              )
+        CROSS JOIN clock
+        WHERE a.status = 'active'
+          AND (r.cooldown_until IS NULL OR julianday(r.cooldown_until) <= clock.now_jd)
+          AND NOT EXISTS (
+              SELECT 1 FROM usage_windows exhausted
+              WHERE exhausted.account_id = a.id
+                AND exhausted.quota_key = 'codex'
+                AND exhausted.used_percent >= 100
+                AND (
+                    exhausted.reset_at IS NULL
+                    OR julianday(exhausted.reset_at) IS NULL
+                    OR julianday(exhausted.reset_at) > clock.now_jd
+                )
+          )
         "#,
     );
     if !excluded.is_empty() {
         query.push(" AND a.id NOT IN (");
         let mut separated = query.separated(", ");
         for account_id in excluded {
-            separated.push_bind(account_id);
+            separated.push_bind(*account_id);
         }
         separated.push_unseparated(")");
     }
@@ -719,7 +864,7 @@ pub async fn select_account_for_request(
     }
     query.push(
         r#"COALESCE(r.last_selected_at, '1970-01-01T00:00:00.000Z') ASC,
-                 a.created_at ASC,
+             a.created_at ASC,
         "#,
     );
     if usage_weighted {
@@ -727,38 +872,115 @@ pub async fn select_account_for_request(
     } else {
         query.push("a.rowid ASC");
     }
-    query.push(
-        r#"
-            LIMIT 1
-        )
-        RETURNING account_id
-        "#,
+    query.push(" LIMIT 1");
+}
+
+fn smart_account_preview_query(
+    selected_at: &str,
+    settings: &RuntimeSettings,
+    usage_refresh_interval: Duration,
+    excluded: &HashSet<Uuid>,
+) -> QueryBuilder<'static, Sqlite> {
+    let usage_weighted = settings.routing_strategy != "round_robin";
+    let mut query = QueryBuilder::<Sqlite>::new("");
+    push_smart_routing_ctes(
+        &mut query,
+        selected_at,
+        usage_refresh_interval,
+        usage_weighted,
     );
+    push_smart_account_candidate(&mut query, usage_weighted, excluded);
+    query
+}
+
+/// Preview the account selected by the normal global routing order without
+/// changing cooldowns, timestamps, or in-flight counters.
+pub async fn preview_smart_account(
+    pool: &SqlitePool,
+    settings: &RuntimeSettings,
+    usage_refresh_interval: Duration,
+    excluded: &HashSet<Uuid>,
+) -> AppResult<Option<SmartAccountPreview>> {
+    let selected_at = Utc::now().format("%Y-%m-%dT%H:%M:%S%.9fZ").to_string();
+    let mut query =
+        smart_account_preview_query(&selected_at, settings, usage_refresh_interval, excluded);
     let account_id = query
         .build_query_scalar::<Uuid>()
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| {
-            AppError::Unavailable(
-                "no eligible accounts are available; retry after the current cooldown".to_string(),
-            )
-        })?;
-    tx.commit().await?;
-
-    let reason = if !excluded.is_empty() {
-        SelectionReason::Failover
-    } else if usage_weighted {
-        SelectionReason::UsageWeighted
-    } else {
-        SelectionReason::RoundRobin
-    };
-    match selected_account(pool, crypto, account_id, reason).await {
-        Ok(selected) => Ok(selected),
-        Err(error) => {
-            release_account(pool, account_id).await.ok();
-            Err(error)
-        }
+        .fetch_optional(pool)
+        .await?;
+    match account_id {
+        Some(account_id) => Ok(Some(SmartAccountPreview {
+            account_id,
+            account_label: account_display_label(pool, account_id).await?,
+        })),
+        None => Ok(None),
     }
+}
+
+async fn preview_smart_account_id_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+    selected_at: &str,
+    settings: &RuntimeSettings,
+    usage_refresh_interval: Duration,
+    excluded: &HashSet<Uuid>,
+) -> AppResult<Option<Uuid>> {
+    let mut query =
+        smart_account_preview_query(selected_at, settings, usage_refresh_interval, excluded);
+    query
+        .build_query_scalar::<Uuid>()
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(AppError::Database)
+}
+
+async fn account_is_eligible_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+    account_id: Uuid,
+    selected_at: &str,
+) -> AppResult<bool> {
+    let eligible = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM accounts account
+        INNER JOIN account_runtime_state runtime ON runtime.account_id = account.id
+        WHERE account.id = $1
+          AND account.status = 'active'
+          AND (
+              runtime.cooldown_until IS NULL
+              OR julianday(runtime.cooldown_until) <= julianday($2)
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM usage_windows exhausted
+              WHERE exhausted.account_id = account.id
+                AND exhausted.quota_key = 'codex'
+                AND exhausted.used_percent >= 100
+                AND (
+                    exhausted.reset_at IS NULL
+                    OR julianday(exhausted.reset_at) IS NULL
+                    OR julianday(exhausted.reset_at) > julianday($2)
+                )
+          )
+        "#,
+    )
+    .bind(account_id)
+    .bind(selected_at)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(eligible == 1)
+}
+
+async fn account_display_label_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+    account_id: Uuid,
+) -> AppResult<Option<String>> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT CASE WHEN label = '' THEN 'unlabeled' ELSE label END FROM accounts WHERE id = $1",
+    )
+    .bind(account_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(AppError::Database)
 }
 
 async fn selected_account(
@@ -882,28 +1104,783 @@ pub async fn reset_inflight(pool: &SqlitePool) -> AppResult<()> {
     Ok(())
 }
 
+/// Apply one privacy-preserving session route command. Alias/root merging,
+/// smart fallback selection, command persistence, and affinity rewrites all
+/// happen in one SQLite transaction. A dry run executes the same reads and
+/// decision logic, then rolls the transaction back.
+pub async fn apply_session_route_action(
+    pool: &SqlitePool,
+    settings: &RuntimeSettings,
+    usage_refresh_interval: Duration,
+    request: SessionRouteActionRequest,
+    live_account_ids: &HashSet<Uuid>,
+) -> AppResult<SessionRouteActionResponse> {
+    if !valid_affinity_hash(&request.root_key_hash) {
+        return Err(AppError::BadRequest(
+            "session root hashes must be 64 lowercase hexadecimal characters".to_string(),
+        ));
+    }
+    let input_keys = validate_session_route_keys(&request.keys)?;
+    if input_keys.is_empty() {
+        return Err(AppError::BadRequest(
+            "at least one session route key is required".to_string(),
+        ));
+    }
+    if !input_keys
+        .iter()
+        .any(|key| key.key_hash == request.root_key_hash)
+    {
+        return Err(AppError::BadRequest(
+            "the session root hash must also be present in keys".to_string(),
+        ));
+    }
+    let requested_target = match request.action {
+        SessionRouteActionKind::Rebalance => {
+            if request.target.is_some() {
+                return Err(AppError::BadRequest(
+                    "rebalance actions do not accept a target".to_string(),
+                ));
+            }
+            None
+        }
+        SessionRouteActionKind::Reroute => {
+            let target = request.target.as_deref().ok_or_else(|| {
+                AppError::BadRequest("reroute actions require a target".to_string())
+            })?;
+            Some(resolve_session_route_target(pool, target).await?)
+        }
+    };
+
+    let selected_at = Utc::now().format("%Y-%m-%dT%H:%M:%S%.9fZ").to_string();
+    let mut tx = pool.begin().await?;
+    let canonical_existed = if request.dry_run {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM session_roots WHERE root_key_hash = $1")
+            .bind(&request.root_key_hash)
+            .fetch_one(&mut *tx)
+            .await?
+            == 1
+    } else {
+        // This is intentionally the first statement in the transaction: it
+        // obtains SQLite's single-writer lock before any merge snapshot.
+        sqlx::query_scalar::<_, String>(
+            r#"
+            INSERT INTO session_roots (root_key_hash)
+            VALUES ($1)
+            ON CONFLICT (root_key_hash) DO NOTHING
+            RETURNING root_key_hash
+            "#,
+        )
+        .bind(&request.root_key_hash)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_none()
+    };
+
+    if let Some(target) = requested_target.as_ref()
+        && account_display_label_in_transaction(&mut tx, target.account_id)
+            .await?
+            .is_none()
+    {
+        tx.rollback().await?;
+        return Err(AppError::NotFound("account target not found".to_string()));
+    }
+
+    let mut prior_roots_query = QueryBuilder::<Sqlite>::new(
+        "SELECT DISTINCT root_key_hash FROM session_route_keys WHERE key_hash IN (",
+    );
+    let mut separated = prior_roots_query.separated(", ");
+    for key in &input_keys {
+        separated.push_bind(key.key_hash.clone());
+    }
+    separated.push_unseparated(")");
+    let prior_mapped_roots = prior_roots_query
+        .build_query_scalar::<String>()
+        .fetch_all(&mut *tx)
+        .await?;
+    let mut root_hashes = prior_mapped_roots.iter().cloned().collect::<HashSet<_>>();
+    root_hashes.insert(request.root_key_hash.clone());
+
+    let mut existing_keys_query = QueryBuilder::<Sqlite>::new(
+        "SELECT key_hash, root_key_hash, kind FROM session_route_keys WHERE root_key_hash IN (",
+    );
+    let mut separated = existing_keys_query.separated(", ");
+    for root in &root_hashes {
+        separated.push_bind(root.clone());
+    }
+    separated.push_unseparated(") ORDER BY key_hash");
+    let existing_keys = existing_keys_query
+        .build_query_as::<SessionRouteKeyRow>()
+        .fetch_all(&mut *tx)
+        .await?;
+    let existing_by_hash = existing_keys
+        .iter()
+        .map(|key| (key.key_hash.clone(), key.clone()))
+        .collect::<HashMap<_, _>>();
+    let mut all_keys_by_hash = existing_keys
+        .iter()
+        .map(|key| (key.key_hash.clone(), key.kind.clone()))
+        .collect::<HashMap<_, _>>();
+    for key in &input_keys {
+        all_keys_by_hash.insert(key.key_hash.clone(), key.kind.clone());
+    }
+    let mut all_keys = all_keys_by_hash
+        .into_iter()
+        .map(|(key_hash, kind)| SessionRouteKey { key_hash, kind })
+        .collect::<Vec<_>>();
+    all_keys.sort_by(|left, right| left.key_hash.cmp(&right.key_hash));
+
+    let merged_root_count = prior_mapped_roots
+        .iter()
+        .filter(|root| root.as_str() != request.root_key_hash)
+        .count();
+    let mapping_changed = !canonical_existed
+        || existing_keys.len() != all_keys.len()
+        || all_keys.iter().any(|key| {
+            existing_by_hash.get(&key.key_hash).is_none_or(|existing| {
+                existing.root_key_hash != request.root_key_hash || existing.kind != key.kind
+            })
+        });
+
+    let mut root_generation_query = QueryBuilder::<Sqlite>::new(
+        "SELECT COALESCE(MAX(route_generation), 0) FROM session_roots WHERE root_key_hash IN (",
+    );
+    let mut separated = root_generation_query.separated(", ");
+    for root in &root_hashes {
+        separated.push_bind(root.clone());
+    }
+    separated.push_unseparated(")");
+    let root_generation = root_generation_query
+        .build_query_scalar::<i64>()
+        .fetch_one(&mut *tx)
+        .await?;
+
+    let mut affinity_query = QueryBuilder::<Sqlite>::new(
+        r#"
+        SELECT affinity.key_hash, affinity.kind, affinity.account_id,
+               CASE WHEN account.label = '' THEN 'unlabeled' ELSE account.label END AS account_label,
+               affinity.route_generation
+        FROM affinity
+        INNER JOIN accounts account ON account.id = affinity.account_id
+        WHERE affinity.key_hash IN (
+        "#,
+    );
+    let mut separated = affinity_query.separated(", ");
+    for key in &all_keys {
+        separated.push_bind(key.key_hash.clone());
+    }
+    separated.push_unseparated(") ORDER BY affinity.key_hash");
+    let affinity_routes = affinity_query
+        .build_query_as::<AffinityRouteActionRow>()
+        .fetch_all(&mut *tx)
+        .await?;
+    if !canonical_existed
+        && prior_mapped_roots.is_empty()
+        && affinity_routes.is_empty()
+        && live_account_ids.is_empty()
+    {
+        tx.rollback().await?;
+        return Err(AppError::NotFound(
+            "no routed session matches the supplied fingerprints".to_string(),
+        ));
+    }
+    let affinity_generation = affinity_routes
+        .iter()
+        .map(|route| route.route_generation)
+        .max()
+        .unwrap_or(0);
+    let current_generation = root_generation.max(affinity_generation);
+
+    let mut previous_accounts = affinity_routes
+        .iter()
+        .map(|route| route.account_label.clone())
+        .collect::<HashSet<_>>();
+    for account_id in live_account_ids {
+        if let Some(label) = account_display_label_in_transaction(&mut tx, *account_id).await? {
+            previous_accounts.insert(label);
+        }
+    }
+    let mut previous_accounts = previous_accounts.into_iter().collect::<Vec<_>>();
+    previous_accounts.sort();
+
+    let requested_account = if let Some(target) = requested_target.as_ref() {
+        account_display_label_in_transaction(&mut tx, target.account_id).await?
+    } else {
+        None
+    };
+    let mut used_fallback = false;
+    let effective_account_id = match requested_target.as_ref() {
+        Some(target)
+            if account_is_eligible_in_transaction(&mut tx, target.account_id, &selected_at)
+                .await? =>
+        {
+            Some(target.account_id)
+        }
+        Some(_) => {
+            used_fallback = true;
+            preview_smart_account_id_in_transaction(
+                &mut tx,
+                &selected_at,
+                settings,
+                usage_refresh_interval,
+                &HashSet::new(),
+            )
+            .await?
+        }
+        None => {
+            preview_smart_account_id_in_transaction(
+                &mut tx,
+                &selected_at,
+                settings,
+                usage_refresh_interval,
+                &HashSet::new(),
+            )
+            .await?
+        }
+    };
+    let effective_account = match effective_account_id {
+        Some(account_id) => account_display_label_in_transaction(&mut tx, account_id).await?,
+        None => None,
+    };
+
+    let affinity_by_hash = affinity_routes
+        .iter()
+        .map(|route| (route.key_hash.as_str(), route))
+        .collect::<HashMap<_, _>>();
+    let changed_route_count = effective_account_id.map_or(0, |account_id| {
+        all_keys
+            .iter()
+            .filter(|key| {
+                affinity_by_hash
+                    .get(key.key_hash.as_str())
+                    .is_none_or(|route| route.account_id != account_id || route.kind != key.kind)
+            })
+            .count()
+    });
+    let live_account_changed = effective_account_id
+        .is_some_and(|account_id| live_account_ids.iter().any(|live| *live != account_id));
+    let generation_mismatch = affinity_routes
+        .iter()
+        .any(|route| route.route_generation != current_generation);
+    let requires_move = effective_account_id.is_some()
+        && (changed_route_count != 0
+            || live_account_changed
+            || mapping_changed
+            || generation_mismatch);
+    let route_generation = if requires_move {
+        current_generation
+            .checked_add(1)
+            .ok_or_else(|| AppError::Internal("session route generation overflowed".to_string()))?
+    } else {
+        current_generation
+    };
+    let status = if effective_account_id.is_none() {
+        SessionRouteActionStatus::Pending
+    } else if used_fallback {
+        SessionRouteActionStatus::Fallback
+    } else if requires_move {
+        SessionRouteActionStatus::Applied
+    } else {
+        SessionRouteActionStatus::NoOp
+    };
+
+    if request.dry_run {
+        tx.rollback().await?;
+    } else {
+        sqlx::query(
+            r#"
+            UPDATE session_roots
+            SET route_generation = MAX(route_generation, $2),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE root_key_hash = $1
+            "#,
+        )
+        .bind(&request.root_key_hash)
+        .bind(current_generation)
+        .execute(&mut *tx)
+        .await?;
+        for key in &all_keys {
+            sqlx::query(
+                r#"
+                INSERT INTO session_route_keys (key_hash, root_key_hash, kind)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (key_hash) DO UPDATE SET
+                    root_key_hash = EXCLUDED.root_key_hash,
+                    kind = EXCLUDED.kind,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                "#,
+            )
+            .bind(&key.key_hash)
+            .bind(&request.root_key_hash)
+            .bind(&key.kind)
+            .execute(&mut *tx)
+            .await?;
+        }
+        for old_root in root_hashes
+            .iter()
+            .filter(|root| root.as_str() != request.root_key_hash)
+        {
+            sqlx::query("DELETE FROM session_roots WHERE root_key_hash = $1")
+                .bind(old_root)
+                .execute(&mut *tx)
+                .await?;
+        }
+        if requires_move {
+            let account_id = effective_account_id.expect("move requires an effective account");
+            for key in &all_keys {
+                sqlx::query(
+                    r#"
+                    INSERT INTO affinity (
+                        key_hash, kind, account_id, route_generation, last_used_at
+                    ) VALUES (
+                        $1, $2, $3, $4, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    )
+                    ON CONFLICT (key_hash) DO UPDATE SET
+                        kind = EXCLUDED.kind,
+                        account_id = EXCLUDED.account_id,
+                        route_generation = EXCLUDED.route_generation,
+                        last_used_at = EXCLUDED.last_used_at
+                    "#,
+                )
+                .bind(&key.key_hash)
+                .bind(&key.kind)
+                .bind(account_id)
+                .bind(route_generation)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        sqlx::query(
+            r#"
+            UPDATE session_roots
+            SET route_generation = $2,
+                last_action = $3,
+                requested_account_id = $4,
+                effective_account_id = $5,
+                action_status = $6,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE root_key_hash = $1
+            "#,
+        )
+        .bind(&request.root_key_hash)
+        .bind(route_generation)
+        .bind(request.action.as_str())
+        .bind(requested_target.as_ref().map(|target| target.account_id))
+        .bind(effective_account_id)
+        .bind(status.as_str())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+    }
+
+    Ok(SessionRouteActionResponse {
+        root_key_hash: request.root_key_hash.clone(),
+        session_fingerprint: request.root_key_hash[..12].to_string(),
+        action: request.action,
+        status,
+        requested_account,
+        effective_account,
+        previous_accounts,
+        route_generation,
+        linked_route_count: all_keys.len(),
+        changed_route_count,
+        merged_root_count,
+        dry_run: request.dry_run,
+    })
+}
+
+/// Reconstruct durable pending commands for the scheduler. Requests are
+/// intentionally non-serializable because they contain complete hashes and an
+/// internal UUID selector.
+pub async fn list_pending_session_route_actions(
+    pool: &SqlitePool,
+    limit: i64,
+) -> AppResult<Vec<SessionRouteActionRequest>> {
+    let roots = sqlx::query_as::<_, (String, String, Option<Uuid>)>(
+        r#"
+        SELECT root_key_hash, last_action, requested_account_id
+        FROM session_roots
+        WHERE action_status = 'pending'
+          AND last_action IN ('rebalance', 'reroute')
+        ORDER BY updated_at ASC, root_key_hash ASC
+        LIMIT $1
+        "#,
+    )
+    .bind(limit.clamp(1, 100))
+    .fetch_all(pool)
+    .await?;
+    let mut pending = Vec::with_capacity(roots.len());
+    for (root_key_hash, action, requested_account_id) in roots {
+        let mut action = parse_session_route_action(&action)?;
+        if action == SessionRouteActionKind::Reroute && requested_account_id.is_none() {
+            action = SessionRouteActionKind::Rebalance;
+        }
+        let keys = sqlx::query_as::<_, (String, String)>(
+            r#"
+            SELECT key_hash, kind
+            FROM session_route_keys
+            WHERE root_key_hash = $1
+            ORDER BY key_hash
+            "#,
+        )
+        .bind(&root_key_hash)
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|(key_hash, kind)| SessionRouteKey { key_hash, kind })
+        .collect();
+        pending.push(SessionRouteActionRequest {
+            root_key_hash,
+            keys,
+            action,
+            target: requested_account_id.map(|account_id| account_id.to_string()),
+            dry_run: false,
+        });
+    }
+    Ok(pending)
+}
+
 pub async fn bind_affinity(
     pool: &SqlitePool,
     key_hash: &str,
     kind: &str,
     account_id: Uuid,
 ) -> AppResult<()> {
-    sqlx::query(
+    let key = SessionRouteKey {
+        key_hash: key_hash.to_string(),
+        kind: kind.to_string(),
+    };
+    bind_affinities_at_epoch(pool, std::slice::from_ref(&key), account_id, None).await?;
+    Ok(())
+}
+
+/// Resolve the newest durable routing epoch attached to any supplied hashed
+/// alias. Normally all aliases map to one root; ordering by the latest root
+/// command also gives deterministic behavior while a historical conflict is
+/// waiting to be merged by a route action.
+pub async fn resolve_session_route_epoch(
+    pool: &SqlitePool,
+    keys: &[SessionRouteKey],
+) -> AppResult<Option<SessionRouteEpoch>> {
+    let keys = validate_session_route_keys(keys)?;
+    if keys.is_empty() {
+        return Ok(None);
+    }
+    let mut query = QueryBuilder::<Sqlite>::new(
         r#"
-        INSERT INTO affinity (key_hash, kind, account_id)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (key_hash) DO UPDATE SET
-            kind = EXCLUDED.kind,
-            account_id = EXCLUDED.account_id,
-            last_used_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        SELECT roots.root_key_hash, roots.route_generation, route_key.key_hash
+        FROM session_route_keys route_key
+        INNER JOIN session_roots roots ON roots.root_key_hash = route_key.root_key_hash
+        WHERE route_key.key_hash IN (
+        "#,
+    );
+    let mut separated = query.separated(", ");
+    for key in &keys {
+        separated.push_bind(key.key_hash.clone());
+    }
+    separated.push_unseparated(
+        r#")
+        ORDER BY julianday(roots.updated_at) DESC,
+                 roots.route_generation DESC,
+                 roots.root_key_hash ASC,
+                 route_key.key_hash ASC
+        LIMIT 1"#,
+    );
+    query
+        .build_query_as::<(String, i64, String)>()
+        .fetch_optional(pool)
+        .await
+        .map(|row| {
+            row.map(
+                |(root_key_hash, route_generation, selection_key_hash)| SessionRouteEpoch {
+                    root_key_hash,
+                    route_generation,
+                    selection_key_hash,
+                },
+            )
+        })
+        .map_err(AppError::Database)
+}
+
+pub async fn resolve_session_route_context(
+    pool: &SqlitePool,
+    keys: &[SessionRouteKey],
+) -> AppResult<Option<SessionRouteContext>> {
+    let Some(epoch) = resolve_session_route_epoch(pool, keys).await? else {
+        return Ok(None);
+    };
+    let row = sqlx::query_as::<
+        _,
+        (
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<Uuid>,
+            Option<Uuid>,
+        ),
+    >(
+        r#"
+        SELECT route_generation, last_action, action_status,
+               requested_account_id, effective_account_id
+        FROM session_roots
+        WHERE root_key_hash = $1
         "#,
     )
-    .bind(key_hash)
-    .bind(kind)
-    .bind(account_id)
-    .execute(pool)
+    .bind(&epoch.root_key_hash)
+    .fetch_optional(pool)
     .await?;
-    Ok(())
+    let Some((route_generation, action, action_status, requested_account_id, effective_account_id)) =
+        row
+    else {
+        return Ok(None);
+    };
+    Ok(Some(SessionRouteContext {
+        root_key_hash: epoch.root_key_hash,
+        route_generation,
+        action: action
+            .as_deref()
+            .map(parse_session_route_action)
+            .transpose()?,
+        action_status: action_status
+            .as_deref()
+            .map(parse_session_route_status)
+            .transpose()?,
+        requested_account_id,
+        effective_account_id,
+    }))
+}
+
+pub async fn session_route_epoch_is_current(
+    pool: &SqlitePool,
+    epoch: &SessionRouteEpoch,
+) -> AppResult<bool> {
+    let current = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM session_roots
+        WHERE root_key_hash = $1 AND route_generation = $2
+        "#,
+    )
+    .bind(&epoch.root_key_hash)
+    .bind(epoch.route_generation)
+    .fetch_one(pool)
+    .await?;
+    Ok(current == 1)
+}
+
+/// Bind one or more affinity aliases only if their captured root epoch is still
+/// current. `None` retains legacy behavior only while no alias has been claimed
+/// by a durable session root. A false result means the caller must reconnect.
+pub async fn bind_affinities_at_epoch(
+    pool: &SqlitePool,
+    keys: &[SessionRouteKey],
+    account_id: Uuid,
+    epoch: Option<&SessionRouteEpoch>,
+) -> AppResult<bool> {
+    let keys = validate_session_route_keys(keys)?;
+    if keys.is_empty() {
+        return Ok(true);
+    }
+    let mut tx = pool.begin().await?;
+    if let Some(epoch) = epoch {
+        let locked = sqlx::query_as::<_, (i64, Option<String>, Option<Uuid>, Option<Uuid>)>(
+            r#"
+            UPDATE session_roots
+            SET route_generation = route_generation
+            WHERE root_key_hash = $1 AND route_generation = $2
+            RETURNING route_generation, last_action,
+                      requested_account_id, effective_account_id
+            "#,
+        )
+        .bind(&epoch.root_key_hash)
+        .bind(epoch.route_generation)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((_, last_action, requested_account_id, effective_account_id)) = locked else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+        let mut conflicts = QueryBuilder::<Sqlite>::new(
+            "SELECT COUNT(*) FROM session_route_keys WHERE root_key_hash <> ",
+        );
+        conflicts.push_bind(epoch.root_key_hash.clone());
+        conflicts.push(" AND key_hash IN (");
+        let mut separated = conflicts.separated(", ");
+        for key in &keys {
+            separated.push_bind(key.key_hash.clone());
+        }
+        separated.push_unseparated(")");
+        let conflict_count = conflicts
+            .build_query_scalar::<i64>()
+            .fetch_one(&mut *tx)
+            .await?;
+        if conflict_count != 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        for key in &keys {
+            sqlx::query(
+                r#"
+                INSERT INTO session_route_keys (key_hash, root_key_hash, kind)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (key_hash) DO UPDATE SET
+                    kind = EXCLUDED.kind,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE session_route_keys.root_key_hash = EXCLUDED.root_key_hash
+                "#,
+            )
+            .bind(&key.key_hash)
+            .bind(&epoch.root_key_hash)
+            .bind(&key.kind)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                r#"
+                INSERT INTO affinity (
+                    key_hash, kind, account_id, route_generation, last_used_at
+                ) VALUES (
+                    $1, $2, $3, $4, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                )
+                ON CONFLICT (key_hash) DO UPDATE SET
+                    kind = EXCLUDED.kind,
+                    account_id = EXCLUDED.account_id,
+                    route_generation = EXCLUDED.route_generation,
+                    last_used_at = EXCLUDED.last_used_at
+                WHERE affinity.route_generation <= EXCLUDED.route_generation
+                "#,
+            )
+            .bind(&key.key_hash)
+            .bind(&key.kind)
+            .bind(account_id)
+            .bind(epoch.route_generation)
+            .execute(&mut *tx)
+            .await?;
+        }
+        if last_action.as_deref() == Some("reroute") && effective_account_id != Some(account_id) {
+            sqlx::query(
+                r#"
+                UPDATE affinity
+                SET account_id = $2,
+                    route_generation = $3,
+                    last_used_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE key_hash IN (
+                    SELECT key_hash
+                    FROM session_route_keys
+                    WHERE root_key_hash = $1
+                )
+                "#,
+            )
+            .bind(&epoch.root_key_hash)
+            .bind(account_id)
+            .bind(epoch.route_generation)
+            .execute(&mut *tx)
+            .await?;
+            let fallback = requested_account_id != Some(account_id);
+            sqlx::query(
+                r#"
+                UPDATE session_roots
+                SET effective_account_id = $2,
+                    action_status = CASE WHEN $3 THEN 'fallback' ELSE 'applied' END,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE root_key_hash = $1 AND route_generation = $4
+                "#,
+            )
+            .bind(&epoch.root_key_hash)
+            .bind(account_id)
+            .bind(fallback)
+            .bind(epoch.route_generation)
+            .execute(&mut *tx)
+            .await?;
+        }
+    } else {
+        let preferred_root = keys
+            .iter()
+            .find(|key| key.kind == "session_id")
+            .unwrap_or(&keys[0])
+            .key_hash
+            .clone();
+        let inserted_root = sqlx::query_scalar::<_, String>(
+            r#"
+            INSERT INTO session_roots (root_key_hash)
+            VALUES ($1)
+            ON CONFLICT (root_key_hash) DO NOTHING
+            RETURNING root_key_hash
+            "#,
+        )
+        .bind(&preferred_root)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let mut mapped = QueryBuilder::<Sqlite>::new(
+            r#"
+            SELECT DISTINCT roots.root_key_hash, roots.route_generation, roots.last_action
+            FROM session_route_keys route_key
+            INNER JOIN session_roots roots ON roots.root_key_hash = route_key.root_key_hash
+            WHERE route_key.key_hash IN (
+            "#,
+        );
+        let mut separated = mapped.separated(", ");
+        for key in &keys {
+            separated.push_bind(key.key_hash.clone());
+        }
+        separated.push_unseparated(")");
+        let mapped_roots = mapped
+            .build_query_as::<(String, i64, Option<String>)>()
+            .fetch_all(&mut *tx)
+            .await?;
+        if mapped_roots.len() > 1
+            || mapped_roots
+                .first()
+                .is_some_and(|(_, generation, action)| *generation != 0 || action.is_some())
+        {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let root_key_hash = mapped_roots
+            .first()
+            .map(|(root, _, _)| root.clone())
+            .unwrap_or_else(|| preferred_root.clone());
+        if inserted_root.is_some() && root_key_hash != preferred_root {
+            sqlx::query(
+                "DELETE FROM session_roots WHERE root_key_hash = $1 AND last_action IS NULL AND NOT EXISTS (SELECT 1 FROM session_route_keys WHERE root_key_hash = $1)",
+            )
+            .bind(&preferred_root)
+            .execute(&mut *tx)
+            .await?;
+        }
+        for key in &keys {
+            sqlx::query(
+                r#"
+                INSERT INTO session_route_keys (key_hash, root_key_hash, kind)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (key_hash) DO UPDATE SET
+                    kind = EXCLUDED.kind,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE session_route_keys.root_key_hash = EXCLUDED.root_key_hash
+                "#,
+            )
+            .bind(&key.key_hash)
+            .bind(&root_key_hash)
+            .bind(&key.kind)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                r#"
+                INSERT INTO affinity (key_hash, kind, account_id)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (key_hash) DO UPDATE SET
+                    kind = EXCLUDED.kind,
+                    account_id = EXCLUDED.account_id,
+                    last_used_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                "#,
+            )
+            .bind(&key.key_hash)
+            .bind(&key.kind)
+            .bind(account_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+    tx.commit().await?;
+    Ok(true)
 }
 
 pub fn affinity_hash(kind: &str, value: &str) -> String {
@@ -912,6 +1889,79 @@ pub fn affinity_hash(kind: &str, value: &str) -> String {
     hasher.update([0]);
     hasher.update(value.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+fn validate_session_route_keys(keys: &[SessionRouteKey]) -> AppResult<Vec<SessionRouteKey>> {
+    if keys.len() > 500 {
+        return Err(AppError::BadRequest(
+            "at most 500 session route keys can be used at once".to_string(),
+        ));
+    }
+    let mut unique = HashMap::<String, String>::with_capacity(keys.len());
+    let mut validated = Vec::with_capacity(keys.len());
+    for key in keys {
+        if !valid_affinity_hash(&key.key_hash) {
+            return Err(AppError::BadRequest(
+                "session route hashes must be 64 lowercase hexadecimal characters".to_string(),
+            ));
+        }
+        let kind = key.kind.trim();
+        if kind.is_empty()
+            || kind.len() > 64
+            || !kind
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return Err(AppError::BadRequest(
+                "session route kinds must be 1-64 ASCII letters, numbers, '_' or '-'".to_string(),
+            ));
+        }
+        match unique.get(&key.key_hash) {
+            Some(previous) if previous != kind => {
+                return Err(AppError::BadRequest(
+                    "one session route hash cannot have multiple kinds".to_string(),
+                ));
+            }
+            Some(_) => {}
+            None => {
+                unique.insert(key.key_hash.clone(), kind.to_string());
+                validated.push(SessionRouteKey {
+                    key_hash: key.key_hash.clone(),
+                    kind: kind.to_string(),
+                });
+            }
+        }
+    }
+    Ok(validated)
+}
+
+fn valid_affinity_hash(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn parse_session_route_action(value: &str) -> AppResult<SessionRouteActionKind> {
+    match value {
+        "rebalance" => Ok(SessionRouteActionKind::Rebalance),
+        "reroute" => Ok(SessionRouteActionKind::Reroute),
+        _ => Err(AppError::Internal(
+            "database contains an invalid session route action".to_string(),
+        )),
+    }
+}
+
+fn parse_session_route_status(value: &str) -> AppResult<SessionRouteActionStatus> {
+    match value {
+        "applied" => Ok(SessionRouteActionStatus::Applied),
+        "fallback" => Ok(SessionRouteActionStatus::Fallback),
+        "pending" => Ok(SessionRouteActionStatus::Pending),
+        "no_op" => Ok(SessionRouteActionStatus::NoOp),
+        _ => Err(AppError::Internal(
+            "database contains an invalid session route status".to_string(),
+        )),
+    }
 }
 
 pub async fn list_session_routes(
@@ -930,7 +1980,7 @@ pub async fn list_session_routes(
             af.last_used_at
         FROM affinity af
         INNER JOIN accounts a ON a.id = af.account_id
-        WHERE af.kind IN ('session_id', 'thread_id', 'conversation_id')
+        WHERE af.kind IN ('session_id', 'thread_id', 'conversation_id', 'prompt_cache_key')
           AND julianday(af.last_used_at) >= julianday('now', printf('-%d seconds', $1))
         ORDER BY julianday(af.last_used_at) DESC, af.key_hash ASC
         LIMIT $2
@@ -962,8 +2012,7 @@ pub async fn resolve_session_routes(
             af.last_used_at
         FROM affinity af
         INNER JOIN accounts a ON a.id = af.account_id
-        WHERE af.kind IN ('session_id', 'thread_id', 'conversation_id')
-          AND julianday(af.last_used_at) >= julianday('now', printf('-%d seconds', "#,
+        WHERE julianday(af.last_used_at) >= julianday('now', printf('-%d seconds', "#,
     );
     query.push_bind(sticky_ttl_seconds.max(1));
     query.push(")) AND af.key_hash IN (");
@@ -1511,4 +2560,308 @@ pub fn normalize_label(label: &str) -> AppResult<String> {
         ));
     }
     Ok(value)
+}
+
+#[cfg(test)]
+mod session_route_action_tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    async fn route_test_pool() -> (SqlitePool, PathBuf) {
+        let path =
+            std::env::temp_dir().join(format!("codex-lb-session-route-{}.sqlite", Uuid::new_v4()));
+        let pool = connect(&format!("sqlite://{}", path.display()))
+            .await
+            .expect("connect route test database");
+        run_migrations(&pool).await.expect("run route migrations");
+        (pool, path)
+    }
+
+    async fn insert_route_test_account(pool: &SqlitePool, label: &str, created_at: &str) -> Uuid {
+        let account_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO accounts (
+                id, label, email, plan_type,
+                encrypted_access_token, encrypted_refresh_token, encrypted_id_token,
+                created_at, updated_at
+            ) VALUES ($1, $2, $3, 'plus', 'access', 'refresh', 'id', $4, $4)
+            "#,
+        )
+        .bind(account_id)
+        .bind(label)
+        .bind(format!("{label}@example.invalid"))
+        .bind(created_at)
+        .execute(pool)
+        .await
+        .expect("insert route test account");
+        sqlx::query("INSERT INTO account_runtime_state (account_id) VALUES ($1)")
+            .bind(account_id)
+            .execute(pool)
+            .await
+            .expect("insert route runtime row");
+        account_id
+    }
+
+    fn route_key(kind: &str, value: &str) -> SessionRouteKey {
+        SessionRouteKey {
+            key_hash: affinity_hash(kind, value),
+            kind: kind.to_string(),
+        }
+    }
+
+    fn reroute_request(
+        root: &SessionRouteKey,
+        keys: Vec<SessionRouteKey>,
+        target: &str,
+        dry_run: bool,
+    ) -> SessionRouteActionRequest {
+        SessionRouteActionRequest {
+            root_key_hash: root.key_hash.clone(),
+            keys,
+            action: SessionRouteActionKind::Reroute,
+            target: Some(target.to_string()),
+            dry_run,
+        }
+    }
+
+    async fn close_route_test_pool(pool: SqlitePool, path: PathBuf) {
+        pool.close().await;
+        tokio::fs::remove_file(path)
+            .await
+            .expect("remove route test database");
+    }
+
+    #[tokio::test]
+    async fn route_actions_are_atomic_durable_and_generation_guarded() {
+        let (pool, path) = route_test_pool().await;
+        let personal =
+            insert_route_test_account(&pool, "personal", "2020-01-01T00:00:00.000Z").await;
+        let work = insert_route_test_account(&pool, "work", "2021-01-01T00:00:00.000Z").await;
+        let session = route_key("session_id", "route-action-session");
+        bind_affinity(&pool, &session.key_hash, &session.kind, personal)
+            .await
+            .expect("seed legacy route");
+        let old_epoch = resolve_session_route_epoch(&pool, std::slice::from_ref(&session))
+            .await
+            .expect("resolve route epoch")
+            .expect("seeded route root");
+        assert_eq!(old_epoch.route_generation, 0);
+
+        let settings = RuntimeSettings::default();
+        let applied = apply_session_route_action(
+            &pool,
+            &settings,
+            Duration::from_secs(120),
+            reroute_request(&session, vec![session.clone()], "work", false),
+            &HashSet::new(),
+        )
+        .await
+        .expect("apply reroute");
+        assert_eq!(applied.status, SessionRouteActionStatus::Applied);
+        assert_eq!(applied.route_generation, 1);
+        assert_eq!(applied.previous_accounts, ["personal"]);
+        assert_eq!(applied.effective_account.as_deref(), Some("work"));
+
+        let persisted: (Uuid, i64) =
+            sqlx::query_as("SELECT account_id, route_generation FROM affinity WHERE key_hash = $1")
+                .bind(&session.key_hash)
+                .fetch_one(&pool)
+                .await
+                .expect("read applied route");
+        assert_eq!(persisted, (work, 1));
+        assert!(
+            !bind_affinities_at_epoch(
+                &pool,
+                std::slice::from_ref(&session),
+                personal,
+                Some(&old_epoch),
+            )
+            .await
+            .expect("reject stale route bind")
+        );
+
+        let no_op = apply_session_route_action(
+            &pool,
+            &settings,
+            Duration::from_secs(120),
+            reroute_request(&session, vec![session.clone()], "work", false),
+            &HashSet::new(),
+        )
+        .await
+        .expect("repeat reroute");
+        assert_eq!(no_op.status, SessionRouteActionStatus::NoOp);
+        assert_eq!(no_op.route_generation, 1);
+
+        let dry_run = apply_session_route_action(
+            &pool,
+            &settings,
+            Duration::from_secs(120),
+            SessionRouteActionRequest {
+                root_key_hash: session.key_hash.clone(),
+                keys: vec![session.clone()],
+                action: SessionRouteActionKind::Rebalance,
+                target: None,
+                dry_run: true,
+            },
+            &HashSet::new(),
+        )
+        .await
+        .expect("preview rebalance");
+        assert!(dry_run.dry_run);
+        assert_eq!(dry_run.status, SessionRouteActionStatus::Applied);
+        assert_eq!(dry_run.effective_account.as_deref(), Some("personal"));
+        let after_dry_run: (Uuid, i64) =
+            sqlx::query_as("SELECT account_id, route_generation FROM affinity WHERE key_hash = $1")
+                .bind(&session.key_hash)
+                .fetch_one(&pool)
+                .await
+                .expect("read route after dry run");
+        assert_eq!(after_dry_run, (work, 1));
+
+        sqlx::query("UPDATE accounts SET status = 'paused' WHERE id = $1")
+            .bind(work)
+            .execute(&pool)
+            .await
+            .expect("pause requested target");
+        let fallback = apply_session_route_action(
+            &pool,
+            &settings,
+            Duration::from_secs(120),
+            reroute_request(&session, vec![session.clone()], "work", false),
+            &HashSet::new(),
+        )
+        .await
+        .expect("fallback reroute");
+        assert_eq!(fallback.status, SessionRouteActionStatus::Fallback);
+        assert_eq!(fallback.effective_account.as_deref(), Some("personal"));
+        assert_eq!(fallback.route_generation, 2);
+
+        sqlx::query("UPDATE accounts SET status = 'paused' WHERE id = $1")
+            .bind(personal)
+            .execute(&pool)
+            .await
+            .expect("pause fallback target");
+        let pending = apply_session_route_action(
+            &pool,
+            &settings,
+            Duration::from_secs(120),
+            reroute_request(&session, vec![session.clone()], "work", false),
+            &HashSet::new(),
+        )
+        .await
+        .expect("persist pending reroute");
+        assert_eq!(pending.status, SessionRouteActionStatus::Pending);
+        assert_eq!(pending.route_generation, 2);
+        let after_pending: (Uuid, i64) =
+            sqlx::query_as("SELECT account_id, route_generation FROM affinity WHERE key_hash = $1")
+                .bind(&session.key_hash)
+                .fetch_one(&pool)
+                .await
+                .expect("read route after pending command");
+        assert_eq!(after_pending, (personal, 2));
+        let retry = list_pending_session_route_actions(&pool, 100)
+            .await
+            .expect("list pending reroutes");
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].target.as_deref(), Some(work.to_string().as_str()));
+
+        close_route_test_pool(pool, path).await;
+    }
+
+    #[tokio::test]
+    async fn route_actions_merge_roots_and_reject_orphans() {
+        let (pool, path) = route_test_pool().await;
+        let personal =
+            insert_route_test_account(&pool, "personal", "2020-01-01T00:00:00.000Z").await;
+        let work = insert_route_test_account(&pool, "work", "2021-01-01T00:00:00.000Z").await;
+        let root = route_key("session_id", "merge-root");
+        let alias = route_key("prompt_cache_key", "merge-alias");
+        bind_affinity(&pool, &root.key_hash, &root.kind, personal)
+            .await
+            .expect("seed first route root");
+        bind_affinity(&pool, &alias.key_hash, &alias.kind, work)
+            .await
+            .expect("seed second route root");
+
+        let merged = apply_session_route_action(
+            &pool,
+            &RuntimeSettings::default(),
+            Duration::from_secs(120),
+            reroute_request(&root, vec![root.clone(), alias.clone()], "work", false),
+            &HashSet::new(),
+        )
+        .await
+        .expect("merge conflicting roots");
+        assert_eq!(merged.status, SessionRouteActionStatus::Applied);
+        assert_eq!(merged.merged_root_count, 1);
+        assert_eq!(merged.linked_route_count, 2);
+        let accounts = sqlx::query_scalar::<_, Uuid>(
+            "SELECT account_id FROM affinity WHERE key_hash IN ($1, $2) ORDER BY key_hash",
+        )
+        .bind(&root.key_hash)
+        .bind(&alias.key_hash)
+        .fetch_all(&pool)
+        .await
+        .expect("read merged routes");
+        assert_eq!(accounts, vec![work, work]);
+        let current_epoch = resolve_session_route_epoch(&pool, std::slice::from_ref(&root))
+            .await
+            .expect("resolve merged epoch")
+            .expect("merged root epoch");
+        assert!(
+            bind_affinities_at_epoch(
+                &pool,
+                std::slice::from_ref(&root),
+                personal,
+                Some(&current_epoch),
+            )
+            .await
+            .expect("bind successful transport fallback")
+        );
+        let fallback_accounts = sqlx::query_scalar::<_, Uuid>(
+            "SELECT account_id FROM affinity WHERE key_hash IN ($1, $2) ORDER BY key_hash",
+        )
+        .bind(&root.key_hash)
+        .bind(&alias.key_hash)
+        .fetch_all(&pool)
+        .await
+        .expect("read propagated fallback routes");
+        assert_eq!(fallback_accounts, vec![personal, personal]);
+        let fallback_state: (Option<Uuid>, String) = sqlx::query_as(
+            "SELECT effective_account_id, action_status FROM session_roots WHERE root_key_hash = $1",
+        )
+        .bind(&root.key_hash)
+        .fetch_one(&pool)
+        .await
+        .expect("read propagated fallback state");
+        assert_eq!(fallback_state, (Some(personal), "fallback".to_string()));
+        let roots: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_roots")
+            .fetch_one(&pool)
+            .await
+            .expect("count merged roots");
+        assert_eq!(roots, 1);
+
+        let orphan = route_key("session_id", "never-routed-session");
+        let error = apply_session_route_action(
+            &pool,
+            &RuntimeSettings::default(),
+            Duration::from_secs(120),
+            reroute_request(&orphan, vec![orphan.clone()], "work", false),
+            &HashSet::new(),
+        )
+        .await
+        .expect_err("reject an unknown session fingerprint");
+        assert!(matches!(error, AppError::NotFound(_)));
+        let orphan_roots: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM session_roots WHERE root_key_hash = $1")
+                .bind(&orphan.key_hash)
+                .fetch_one(&pool)
+                .await
+                .expect("count rolled-back orphan roots");
+        assert_eq!(orphan_roots, 0);
+
+        close_route_test_pool(pool, path).await;
+    }
 }
