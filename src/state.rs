@@ -3,7 +3,7 @@ use std::sync::Arc;
 use sqlx::SqlitePool;
 use tokio::sync::watch;
 
-use crate::{config::Config, crypto::TokenCrypto};
+use crate::{config::Config, crypto::TokenCrypto, session_registry::SessionConnectionRegistry};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -11,6 +11,7 @@ pub struct AppState {
     pub pool: SqlitePool,
     pub crypto: TokenCrypto,
     pub http: reqwest::Client,
+    pub session_connections: SessionConnectionRegistry,
     shutdown: watch::Sender<bool>,
 }
 
@@ -22,6 +23,7 @@ impl AppState {
             pool,
             crypto,
             http: reqwest::Client::new(),
+            session_connections: SessionConnectionRegistry::default(),
             shutdown,
         }
     }

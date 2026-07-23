@@ -16,7 +16,10 @@ use uuid::Uuid;
 use crate::{
     db,
     error::{AppError, AppResult},
-    models::{AccountTokens, NewRequestLog, SelectedAccount, SelectionReason, UsageData},
+    models::{
+        AccountTokens, NewRequestLog, SelectedAccount, SelectionReason, SessionRouteEpoch,
+        SessionRouteKey, UsageData,
+    },
     state::AppState,
     upstream,
 };
@@ -70,7 +73,9 @@ async fn proxy_request(
     validate_proxy_auth(&state, &headers)?;
     let request_id = request_id(&headers);
     let model = upstream::model_from_body(&body);
-    let affinity = request_affinity(&headers, &body);
+    let affinities = request_affinities(&headers, &body);
+    let route_epoch = db::resolve_session_route_epoch(&state.pool, &affinities).await?;
+    let affinity = selection_affinity(&affinities, route_epoch.as_ref());
     let settings = db::runtime_settings(&state.pool).await?;
     let active_count = db::account_count(&state.pool).await?;
     let attempts = proxy_attempts(active_count, settings.proxy_max_attempts);
@@ -82,9 +87,7 @@ async fn proxy_request(
         let selected = db::select_account_for_request(
             &state.pool,
             &state.crypto,
-            affinity
-                .as_ref()
-                .map(|affinity| (affinity.hash.as_str(), affinity.kind.as_str())),
+            affinity.map(|affinity| (affinity.key_hash.as_str(), affinity.kind.as_str())),
             &excluded,
             &settings,
             state.config.usage_refresh_interval,
@@ -304,8 +307,8 @@ async fn proxy_request(
 
         let response_headers = forwarded_response_headers(response.headers());
         let event_stream = is_event_stream(response.headers());
-        if let Some(affinity) = affinity.as_ref() {
-            bind_affinity(&state, account_id, affinity).await;
+        if !affinities.is_empty() {
+            bind_affinities(&state, account_id, &affinities, route_epoch.as_ref()).await;
         }
         let stream = logged_response_stream(
             state,
@@ -317,6 +320,8 @@ async fn proxy_request(
                 selection_reason,
                 started,
                 event_stream,
+                affinities,
+                route_epoch,
             },
         );
         return build_response(status, response_headers, Body::from_stream(stream));
@@ -364,6 +369,8 @@ struct StreamLogContext {
     selection_reason: SelectionReason,
     started: Instant,
     event_stream: bool,
+    affinities: Vec<SessionRouteKey>,
+    route_epoch: Option<SessionRouteEpoch>,
 }
 
 fn logged_response_stream(
@@ -390,7 +397,13 @@ fn logged_response_stream(
                     {
                         let (usage, response_id) = capture_metadata(&capture, true);
                         if let Some(response_id) = response_id {
-                            bind_response_affinity(&state, account_id, &response_id).await;
+                            bind_response_affinity(
+                                &state,
+                                account_id,
+                                &response_id,
+                                &context.affinities,
+                                context.route_epoch.as_ref(),
+                            ).await;
                         }
                         let (status, error_code) = match terminal {
                             SseTerminal::Completed => ("success", None),
@@ -429,7 +442,13 @@ fn logged_response_stream(
         if !settled {
             let (usage, response_id) = capture_metadata(&capture, context.event_stream);
             if let Some(response_id) = response_id {
-                bind_response_affinity(&state, account_id, &response_id).await;
+                bind_response_affinity(
+                    &state,
+                    account_id,
+                    &response_id,
+                    &context.affinities,
+                    context.route_epoch.as_ref(),
+                ).await;
             }
             let (status, error_code, error_message) = if let Some(message) = failure.as_deref() {
                 ("error", Some("upstream_stream_error"), Some(message))
@@ -530,13 +549,7 @@ async fn log_request(
     }
 }
 
-#[derive(Debug)]
-struct AffinityKey {
-    hash: String,
-    kind: String,
-}
-
-fn request_affinity(headers: &HeaderMap, body: &[u8]) -> Option<AffinityKey> {
+fn request_affinities(headers: &HeaderMap, body: &[u8]) -> Vec<SessionRouteKey> {
     const HEADER_KEYS: [(&str, &str); 6] = [
         ("x-codex-turn-state", "turn_state"),
         ("session_id", "session_id"),
@@ -545,6 +558,8 @@ fn request_affinity(headers: &HeaderMap, body: &[u8]) -> Option<AffinityKey> {
         ("x-codex-conversation-id", "conversation_id"),
         ("conversation_id", "conversation_id"),
     ];
+    let mut seen = HashSet::new();
+    let mut affinities = Vec::with_capacity(HEADER_KEYS.len() + 6);
     for (header_name, kind) in HEADER_KEYS {
         if let Some(value) = headers
             .get(header_name)
@@ -553,11 +568,16 @@ fn request_affinity(headers: &HeaderMap, body: &[u8]) -> Option<AffinityKey> {
             .filter(|value| !value.is_empty())
             .filter(|value| value.len() <= AFFINITY_VALUE_LIMIT)
         {
-            return Some(AffinityKey::new(kind, value));
+            let affinity = session_route_key(kind, value);
+            if seen.insert(affinity.key_hash.clone()) {
+                affinities.push(affinity);
+            }
         }
     }
 
-    let value = serde_json::from_slice::<Value>(body).ok()?;
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return affinities;
+    };
     const BODY_KEYS: [(&str, &str); 6] = [
         ("/prompt_cache_key", "prompt_cache_key"),
         ("/session_id", "session_id"),
@@ -574,35 +594,67 @@ fn request_affinity(headers: &HeaderMap, body: &[u8]) -> Option<AffinityKey> {
             .filter(|value| !value.is_empty())
             .filter(|value| value.len() <= AFFINITY_VALUE_LIMIT)
         {
-            return Some(AffinityKey::new(kind, value));
+            let affinity = session_route_key(kind, value);
+            if seen.insert(affinity.key_hash.clone()) {
+                affinities.push(affinity);
+            }
         }
     }
-    None
+    affinities
 }
 
-impl AffinityKey {
-    fn new(kind: &str, value: &str) -> Self {
-        Self {
-            hash: db::affinity_hash(kind, value),
-            kind: kind.to_string(),
-        }
+fn session_route_key(kind: &str, value: &str) -> SessionRouteKey {
+    SessionRouteKey {
+        key_hash: db::affinity_hash(kind, value),
+        kind: kind.to_string(),
     }
 }
 
-async fn bind_response_affinity(state: &AppState, account_id: Uuid, response_id: &str) {
-    let affinity = AffinityKey::new("response_id", response_id);
-    if let Err(error) =
-        db::bind_affinity(&state.pool, &affinity.hash, &affinity.kind, account_id).await
-    {
-        tracing::warn!(%error, "failed to persist response affinity");
-    }
+fn selection_affinity<'a>(
+    affinities: &'a [SessionRouteKey],
+    route_epoch: Option<&SessionRouteEpoch>,
+) -> Option<&'a SessionRouteKey> {
+    route_epoch
+        .and_then(|epoch| {
+            affinities
+                .iter()
+                .find(|affinity| affinity.key_hash == epoch.selection_key_hash)
+        })
+        .or_else(|| affinities.first())
 }
 
-async fn bind_affinity(state: &AppState, account_id: Uuid, affinity: &AffinityKey) {
-    if let Err(error) =
-        db::bind_affinity(&state.pool, &affinity.hash, &affinity.kind, account_id).await
+async fn bind_response_affinity(
+    state: &AppState,
+    account_id: Uuid,
+    response_id: &str,
+    affinities: &[SessionRouteKey],
+    route_epoch: Option<&SessionRouteEpoch>,
+) {
+    let mut response_affinities = Vec::with_capacity(affinities.len() + 1);
+    response_affinities.extend_from_slice(affinities);
+    let response_affinity = session_route_key("response_id", response_id);
+    if !response_affinities
+        .iter()
+        .any(|affinity| affinity.key_hash == response_affinity.key_hash)
     {
-        tracing::warn!(%error, "failed to persist request affinity");
+        response_affinities.push(response_affinity);
+    }
+    bind_affinities(state, account_id, &response_affinities, route_epoch).await;
+}
+
+async fn bind_affinities(
+    state: &AppState,
+    account_id: Uuid,
+    affinities: &[SessionRouteKey],
+    route_epoch: Option<&SessionRouteEpoch>,
+) {
+    match db::bind_affinities_at_epoch(&state.pool, affinities, account_id, route_epoch).await {
+        Ok(true) => {}
+        Ok(false) => tracing::debug!(
+            %account_id,
+            "ignored affinities from an obsolete session route generation"
+        ),
+        Err(error) => tracing::warn!(%error, "failed to persist request affinities"),
     }
 }
 
@@ -1183,7 +1235,7 @@ mod tests {
 
     use super::{
         SSE_CAPTURE_LIMIT, SseTerminal, SseTerminalDetector, TailCapture, proxy_attempts,
-        request_affinity,
+        request_affinities,
     };
 
     #[test]
@@ -1204,20 +1256,35 @@ mod tests {
 
     #[test]
     fn affinity_values_are_hashed_and_stable() {
-        let first = request_affinity(
+        let first = request_affinities(
             &HeaderMap::new(),
             br#"{"prompt_cache_key":"secret-session"}"#,
-        )
-        .expect("affinity");
-        let second = request_affinity(
+        );
+        let second = request_affinities(
             &HeaderMap::new(),
             br#"{"prompt_cache_key":"secret-session"}"#,
-        )
-        .expect("affinity");
+        );
 
-        assert_eq!(first.hash, second.hash);
-        assert_eq!(first.hash.len(), 64);
-        assert!(!first.hash.contains("secret-session"));
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].key_hash.len(), 64);
+        assert!(!first[0].key_hash.contains("secret-session"));
+    }
+
+    #[test]
+    fn collects_and_deduplicates_all_request_affinity_aliases() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", "session-a".parse().unwrap());
+        headers.insert("x-codex-session-id", "session-a".parse().unwrap());
+
+        let affinities = request_affinities(
+            &headers,
+            br#"{"prompt_cache_key":"cache-b","session_id":"session-a"}"#,
+        );
+
+        assert_eq!(affinities.len(), 2);
+        assert_eq!(affinities[0].kind, "session_id");
+        assert_eq!(affinities[1].kind, "prompt_cache_key");
     }
 
     #[test]

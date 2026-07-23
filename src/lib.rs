@@ -9,6 +9,7 @@ pub mod models;
 pub mod pricing;
 pub mod proxy;
 pub mod scheduler;
+pub mod session_registry;
 pub mod state;
 pub mod status;
 pub mod upstream;

@@ -26,7 +26,10 @@ use uuid::Uuid;
 use crate::{
     db,
     error::{AppError, AppResult},
-    models::{NewRequestLog, SelectedAccount, SelectionReason, UsageData},
+    models::{
+        NewRequestLog, SelectedAccount, SelectionReason, SessionRouteEpoch, SessionRouteKey,
+        UsageData,
+    },
     proxy,
     state::AppState,
     upstream,
@@ -44,8 +47,9 @@ pub async fn proxy_responses(
     upgrade: WebSocketUpgrade,
 ) -> AppResult<AxumResponse> {
     proxy::validate_proxy_auth(&state, &headers)?;
-    let affinity = websocket_affinity(&headers);
-    let prepared = select_and_connect(&state, &headers, affinity.as_ref()).await?;
+    let affinities = websocket_affinities(&headers);
+    let route_epoch = db::resolve_session_route_epoch(&state.pool, &affinities).await?;
+    let prepared = select_and_connect(&state, &headers, &affinities, route_epoch.as_ref()).await?;
     let account_id = prepared.selected.account.id;
     let selection_reason = prepared.selected.selection_reason;
     let upstream_headers = prepared.response_headers;
@@ -60,7 +64,8 @@ pub async fn proxy_responses(
                 client,
                 upstream_socket,
                 account_id,
-                affinity,
+                affinities,
+                route_epoch,
                 selection_reason,
             )
         });
@@ -74,10 +79,24 @@ struct PreparedWebSocket {
     response_headers: HeaderMap,
 }
 
+fn selection_affinity<'a>(
+    affinities: &'a [SessionRouteKey],
+    route_epoch: Option<&SessionRouteEpoch>,
+) -> Option<&'a SessionRouteKey> {
+    route_epoch
+        .and_then(|epoch| {
+            affinities
+                .iter()
+                .find(|affinity| affinity.key_hash == epoch.selection_key_hash)
+        })
+        .or_else(|| affinities.first())
+}
+
 async fn select_and_connect(
     state: &AppState,
     incoming_headers: &HeaderMap,
-    affinity: Option<&AffinityKey>,
+    affinities: &[SessionRouteKey],
+    route_epoch: Option<&SessionRouteEpoch>,
 ) -> AppResult<PreparedWebSocket> {
     let settings = db::runtime_settings(&state.pool).await?;
     let active_count = db::account_count(&state.pool).await?;
@@ -88,12 +107,13 @@ async fn select_and_connect(
     };
     let mut excluded = HashSet::with_capacity(attempts);
     let mut last_error = None;
+    let affinity = selection_affinity(affinities, route_epoch);
 
     for _ in 0..attempts {
         let selected = db::select_account_for_request(
             &state.pool,
             &state.crypto,
-            affinity.map(|item| (item.hash.as_str(), item.kind.as_str())),
+            affinity.map(|item| (item.key_hash.as_str(), item.kind.as_str())),
             &excluded,
             &settings,
             state.config.usage_refresh_interval,
@@ -138,12 +158,24 @@ async fn select_and_connect(
         match connection {
             Ok((socket, response)) => {
                 reservation.release().await;
-                if let Some(affinity) = affinity
-                    && let Err(error) =
-                        db::bind_affinity(&state.pool, &affinity.hash, &affinity.kind, account_id)
-                            .await
-                {
-                    tracing::warn!(%account_id, %error, "failed to bind WebSocket affinity");
+                if !affinities.is_empty() {
+                    match db::bind_affinities_at_epoch(
+                        &state.pool,
+                        affinities,
+                        account_id,
+                        route_epoch,
+                    )
+                    .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => tracing::debug!(
+                            %account_id,
+                            "WebSocket route changed while opening; late registration will reconnect"
+                        ),
+                        Err(error) => {
+                            tracing::warn!(%account_id, %error, "failed to bind WebSocket affinities");
+                        }
+                    }
                 }
                 return Ok(PreparedWebSocket {
                     selected,
@@ -282,13 +314,33 @@ async fn bridge(
     mut client: WebSocket,
     mut upstream_socket: UpstreamSocket,
     account_id: Uuid,
-    affinity: Option<AffinityKey>,
+    affinities: Vec<SessionRouteKey>,
+    route_epoch: Option<SessionRouteEpoch>,
     selection_reason: SelectionReason,
 ) {
+    let route_generation = route_epoch
+        .as_ref()
+        .map_or(0, |epoch| epoch.route_generation);
+    let connection_registration = affinities.first().map(|primary| {
+        let root_key_hash = route_epoch
+            .as_ref()
+            .map(|epoch| epoch.root_key_hash.clone())
+            .unwrap_or_else(|| primary.key_hash.clone());
+        state.session_connections.register(
+            root_key_hash,
+            affinities.iter().map(|affinity| affinity.key_hash.clone()),
+            account_id,
+            route_generation,
+        )
+    });
+    let mut reroute = connection_registration
+        .as_ref()
+        .map(|registration| registration.reroute_receiver());
     let mut active_turn: Option<ActiveTurn> = None;
     let mut next_selection_reason = Some(selection_reason);
     let mut shutdown = state.subscribe_shutdown();
     let mut service_restart = false;
+    let mut session_reroute = false;
     let idle_timeout = state.config.request_timeout;
     let write_timeout = idle_timeout.min(std::time::Duration::from_secs(30));
 
@@ -311,10 +363,17 @@ async fn bridge(
             let _ = shutdown.changed().await;
         };
         tokio::pin!(shutdown_requested);
+        let reroute_requested = wait_for_session_reroute(reroute.as_mut(), route_generation);
+        tokio::pin!(reroute_requested);
         tokio::select! {
+            biased;
             _ = &mut shutdown_requested => {
                 service_restart = true;
                 break "local service restart requested";
+            }
+            _ = &mut reroute_requested => {
+                session_reroute = true;
+                break "targeted session reroute requested";
             }
             _ = &mut hard_turn_timeout => {
                 break "WebSocket request exceeded the configured request budget";
@@ -350,18 +409,27 @@ async fn bridge(
                         .unwrap_or(SelectionReason::WebsocketReuse);
                     match start_turn(&state, account_id, request, selection_reason).await {
                         Ok(turn) => {
-                            if let Some(affinity) = affinity.as_ref()
-                                && let Err(error) = db::bind_affinity(
+                            active_turn = Some(turn);
+                            if !affinities.is_empty() {
+                                match db::bind_affinities_at_epoch(
                                     &state.pool,
-                                    &affinity.hash,
-                                    &affinity.kind,
+                                    &affinities,
                                     account_id,
+                                    route_epoch.as_ref(),
                                 )
                                 .await
-                            {
-                                tracing::warn!(%account_id, %error, "failed to refresh WebSocket session route");
+                                {
+                                    Ok(true) => {}
+                                    Ok(false) => {
+                                        session_reroute = true;
+                                        break "session route generation changed";
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(%account_id, %error, "failed to refresh WebSocket session route");
+                                        break "local session route check failed";
+                                    }
+                                }
                             }
-                            active_turn = Some(turn);
                         }
                         Err(error) => {
                             tracing::warn!(%account_id, %error, "failed to account WebSocket request");
@@ -407,7 +475,15 @@ async fn bridge(
                 {
                     reconnect_for_retry = should_retry_on_new_connection(&event);
                     if let Some(turn) = active_turn.take() {
-                        finish_turn(&state, account_id, turn, &event).await;
+                        finish_turn(
+                            &state,
+                            account_id,
+                            turn,
+                            &event,
+                            &affinities,
+                            route_epoch.as_ref(),
+                        )
+                        .await;
                     }
                 }
                 if reconnect_for_retry {
@@ -432,25 +508,44 @@ async fn bridge(
         }
     };
 
-    if service_restart {
+    if service_restart || session_reroute {
         // Signal reconnect before any SQLite accounting. A contended write can
         // wait for the busy timeout, which is longer than systemd's stop budget.
+        let reason = if session_reroute {
+            "session reroute"
+        } else {
+            "service restart"
+        };
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(1),
             client.send(ClientMessage::Close(Some(ClientCloseFrame {
                 code: 1012,
-                reason: "service restart".into(),
+                reason: reason.into(),
             }))),
         )
         .await;
     }
+    if session_reroute {
+        // Drop the old upstream promptly so it cannot retain account-side
+        // resources while request logging waits on a contended database.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream_socket.close(None),
+        )
+        .await;
+    }
     if let Some(turn) = active_turn {
-        let error_code = if service_restart {
+        let error_code = if session_reroute {
+            "session_reroute"
+        } else if service_restart {
             "service_restart"
         } else {
             "websocket_disconnected"
         };
         finish_disconnected_turn(&state, account_id, turn, error_code, disconnect_message).await;
+    }
+    if session_reroute {
+        return;
     }
     if service_restart {
         let _ = tokio::time::timeout(
@@ -462,6 +557,31 @@ async fn bridge(
     }
     let _ = tokio::time::timeout(write_timeout, upstream_socket.close(None)).await;
     let _ = tokio::time::timeout(write_timeout, client.close()).await;
+}
+
+async fn wait_for_session_reroute(
+    receiver: Option<
+        &mut tokio::sync::watch::Receiver<Option<crate::session_registry::SessionRerouteSignal>>,
+    >,
+    route_generation: i64,
+) {
+    let Some(receiver) = receiver else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    loop {
+        let obsolete = receiver
+            .borrow()
+            .as_ref()
+            .is_some_and(|signal| signal.generation > route_generation);
+        if obsolete {
+            return;
+        }
+        if receiver.changed().await.is_err() {
+            std::future::pending::<()>().await;
+            return;
+        }
+    }
 }
 
 struct ParsedRequest {
@@ -555,7 +675,14 @@ fn event_status(value: &Value) -> Option<u64> {
         })
 }
 
-async fn finish_turn(state: &AppState, account_id: Uuid, turn: ActiveTurn, event: &Value) {
+async fn finish_turn(
+    state: &AppState,
+    account_id: Uuid,
+    turn: ActiveTurn,
+    event: &Value,
+    affinities: &[SessionRouteKey],
+    route_epoch: Option<&SessionRouteEpoch>,
+) {
     let terminal = terminal_event(event).unwrap_or(TerminalEvent::Error);
     let (status, fallback_code) = match terminal {
         TerminalEvent::Completed => ("success", None),
@@ -579,7 +706,7 @@ async fn finish_turn(state: &AppState, account_id: Uuid, turn: ActiveTurn, event
         .or_else(|| event.get("id"))
         .and_then(Value::as_str)
     {
-        bind_response_affinity(state, account_id, response_id).await;
+        bind_response_affinity(state, account_id, response_id, affinities, route_epoch).await;
     }
     if status == "error" {
         apply_terminal_error_state(state, account_id, event, error_message).await;
@@ -712,13 +839,7 @@ fn to_client_message(message: UpstreamMessage) -> Option<ClientMessage> {
     }
 }
 
-#[derive(Debug)]
-struct AffinityKey {
-    hash: String,
-    kind: String,
-}
-
-fn websocket_affinity(headers: &HeaderMap) -> Option<AffinityKey> {
+fn websocket_affinities(headers: &HeaderMap) -> Vec<SessionRouteKey> {
     const KEYS: [(&str, &str); 5] = [
         ("session-id", "session_id"),
         ("x-session-id", "session_id"),
@@ -726,6 +847,8 @@ fn websocket_affinity(headers: &HeaderMap) -> Option<AffinityKey> {
         ("thread-id", "thread_id"),
         ("x-client-request-id", "thread_id"),
     ];
+    let mut seen = HashSet::new();
+    let mut affinities = Vec::with_capacity(KEYS.len());
     for (header_name, kind) in KEYS {
         if let Some(value) = headers
             .get(header_name)
@@ -733,27 +856,49 @@ fn websocket_affinity(headers: &HeaderMap) -> Option<AffinityKey> {
             .map(str::trim)
             .filter(|value| !value.is_empty() && value.len() <= 64 * 1024)
         {
-            return Some(AffinityKey::new(kind, value));
+            let affinity = session_route_key(kind, value);
+            if seen.insert(affinity.key_hash.clone()) {
+                affinities.push(affinity);
+            }
         }
     }
-    None
+    affinities
 }
 
-impl AffinityKey {
-    fn new(kind: &str, value: &str) -> Self {
-        Self {
-            hash: db::affinity_hash(kind, value),
-            kind: kind.to_string(),
-        }
+fn session_route_key(kind: &str, value: &str) -> SessionRouteKey {
+    SessionRouteKey {
+        key_hash: db::affinity_hash(kind, value),
+        kind: kind.to_string(),
     }
 }
 
-async fn bind_response_affinity(state: &AppState, account_id: Uuid, response_id: &str) {
-    let affinity = AffinityKey::new("response_id", response_id);
-    if let Err(error) =
-        db::bind_affinity(&state.pool, &affinity.hash, &affinity.kind, account_id).await
+async fn bind_response_affinity(
+    state: &AppState,
+    account_id: Uuid,
+    response_id: &str,
+    affinities: &[SessionRouteKey],
+    route_epoch: Option<&SessionRouteEpoch>,
+) {
+    let mut response_affinities = Vec::with_capacity(affinities.len() + 1);
+    response_affinities.extend_from_slice(affinities);
+    let response_affinity = session_route_key("response_id", response_id);
+    if !response_affinities
+        .iter()
+        .any(|affinity| affinity.key_hash == response_affinity.key_hash)
     {
-        tracing::warn!(%account_id, %error, "failed to bind WebSocket response affinity");
+        response_affinities.push(response_affinity);
+    }
+    match db::bind_affinities_at_epoch(&state.pool, &response_affinities, account_id, route_epoch)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => tracing::debug!(
+            %account_id,
+            "ignored WebSocket response affinity from an obsolete route generation"
+        ),
+        Err(error) => {
+            tracing::warn!(%account_id, %error, "failed to bind WebSocket response affinity");
+        }
     }
 }
 
@@ -881,7 +1026,7 @@ mod tests {
 
     use super::{
         event_status, parse_response_create, should_retry_on_new_connection, to_client_message,
-        to_upstream_message, websocket_affinity,
+        to_upstream_message, wait_for_session_reroute, websocket_affinities,
     };
 
     #[test]
@@ -903,11 +1048,55 @@ mod tests {
             HeaderValue::from_static("private-session-value"),
         );
 
-        let first = websocket_affinity(&headers).expect("affinity");
-        let second = websocket_affinity(&headers).expect("affinity");
-        assert_eq!(first.hash, second.hash);
+        let first = websocket_affinities(&headers);
+        let second = websocket_affinities(&headers);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first, second);
+        let first = &first[0];
+        assert_eq!(first.key_hash, second[0].key_hash);
         assert_eq!(first.kind, "session_id");
-        assert!(!first.hash.contains("private-session-value"));
+        assert!(!first.key_hash.contains("private-session-value"));
+    }
+
+    #[test]
+    fn collects_and_deduplicates_every_websocket_affinity_alias() {
+        let mut headers = HeaderMap::new();
+        headers.insert("session-id", HeaderValue::from_static("session-a"));
+        headers.insert("x-session-id", HeaderValue::from_static("session-a"));
+        headers.insert("thread-id", HeaderValue::from_static("thread-b"));
+
+        let affinities = websocket_affinities(&headers);
+
+        assert_eq!(affinities.len(), 2);
+        assert_eq!(affinities[0].kind, "session_id");
+        assert_eq!(affinities[1].kind, "thread_id");
+        assert_ne!(affinities[0].key_hash, affinities[1].key_hash);
+    }
+
+    #[tokio::test]
+    async fn reconnects_only_for_a_newer_session_route_generation() {
+        let (signal, mut receiver) =
+            tokio::sync::watch::channel(Some(crate::session_registry::SessionRerouteSignal {
+                generation: 4,
+            }));
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                wait_for_session_reroute(Some(&mut receiver), 4),
+            )
+            .await
+            .is_err()
+        );
+
+        signal.send_replace(Some(crate::session_registry::SessionRerouteSignal {
+            generation: 5,
+        }));
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            wait_for_session_reroute(Some(&mut receiver), 4),
+        )
+        .await
+        .expect("newer reroute generation should reconnect immediately");
     }
 
     #[test]
